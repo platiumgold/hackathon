@@ -3,7 +3,7 @@ import pandas as pd
 from core.data_loader import load_network_data
 from core.aco import run_aco
 from core.gnn import run_gnn
-from hackathon.utils.visualization import draw_heatmap
+from utils.visualization import draw_heatmap
 
 st.set_page_config(page_title="MVP Маршрутизации Энергии", layout="wide")
 
@@ -40,7 +40,7 @@ if st.sidebar.button("🚀 Запустить расчет"):
             if algo == "Ant Colony (ACO)":
                 res = run_aco(nodes, dests, adj, caps, reqs)
                 final_load = res['load_distribution']
-                total_delivered = len(res['successful_paths']) * 10.0  # quantum
+                total_delivered = sum(res['delivered'].values())
 
             elif algo == "Physics-Informed GNN":
                 flows, node_idx, req_list = run_gnn(nodes, caps, reqs, epochs=400)
