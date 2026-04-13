@@ -211,19 +211,27 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=1000, gamma=0.99, lr=3e-4, clip
         penalty = np.sum(overload) * 10
         total_reward = reward - penalty
 
-        # Simplified policy gradient update
-        # We want to increase the probability of edges used in requests that delivered flow
-        # This is a very rough approximation of REINFORCE for this specific non-differentiable environment
-        loss = 0
+        # --- Smart RL Update (Advantage Actor-Critic / PPO-style surrogate) ---
+        # Calculate Advantage using the Critic network to reduce variance
+        target_value = torch.tensor([total_reward], dtype=torch.float32)
+        critic_loss = nn.MSELoss()(value.view(-1), target_value)
+
+        advantage = total_reward - value.item()
+
+        # Actor Loss: Policy Gradient with Advantage
+        # We increase probabilities for paths used if advantage > 0 (result is better than expected),
+        # and penalize (decrease probabilities) if advantage < 0.
+        actor_loss = 0
         for k in range(len(req_list)):
             if delivered[k] > 0:
                 for e in range(num_edges):
                     if requested_flows[k, e] > 0:
-                        # Maximize log prob of chosen actions
-                        # Here, we treat 'weights' as probabilities
-                        loss -= torch.log(weights[k, e] + 1e-8) * delivered[k]
+                        # Maximize log prob scaled by advantage
+                        actor_loss -= torch.log(weights[k, e] + 1e-8) * advantage
 
-        if type(loss) == torch.Tensor:
+        # Combine losses and update
+        if isinstance(actor_loss, torch.Tensor):
+            loss = actor_loss + 0.5 * critic_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
