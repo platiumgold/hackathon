@@ -4,7 +4,7 @@ from core.data_loader import load_network_data
 from core.aco import run_aco
 from core.gnn import run_gnn
 from utils.visualization import draw_heatmap
-
+from core.rl import run_rl
 st.set_page_config(page_title="MVP Маршрутизации Энергии", layout="wide")
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
@@ -18,7 +18,7 @@ st.sidebar.header("📥 Загрузка данных")
 file_req = st.sidebar.file_uploader("Таблица 1.1 (Заявки потоков)", type=['csv', 'xlsx'])
 file_cap = st.sidebar.file_uploader("Таблица 1.2 (Ограничения сети)", type=['csv', 'xlsx'])
 
-algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ", ["Physics-Informed GNN", "Ant Colony (ACO)"])
+algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ", ["Physics-Informed GNN", "Ant Colony (ACO)", "Reinforcement Learning (PPO)"])
 
 if st.sidebar.button("🚀 Запустить расчет"):
     if file_req and file_cap:
@@ -55,6 +55,11 @@ if st.sidebar.button("🚀 Запустить расчет"):
                     for v in range(len(nodes)):
                         if total_edges[u, v].item() >= 1.0:
                             final_load[(nodes[u], nodes[v])] = total_edges[u, v].item()
+
+            elif algo == "Reinforcement Learning (PPO)":
+                res = run_rl(nodes, dests, adj, caps, reqs, epochs=200)
+                final_load = res['load_distribution']
+                total_delivered = sum(res['delivered'].values())
 
         # 3. Вывод метрик (Требование 9.1.1 и 9.1.2)
         col1, col2, col3 = st.columns(3)
