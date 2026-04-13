@@ -30,8 +30,6 @@ def load_network_data(requests_df, capacities_df):
         try:
             cap = float(str(row['Допустимая мощность']).replace(',', '').replace(' ', ''))
             capacities[(u, v)] = cap
-            # Для полносвязности в обе стороны
-            capacities[(v, u)] = cap
             nodes_set.update([u, v])
         except ValueError:
             continue
@@ -39,7 +37,10 @@ def load_network_data(requests_df, capacities_df):
     nodes = list(nodes_set)
     destinations = list(set(dst for src, dst in requests.keys()))
 
-    # Формируем полносвязную матрицу смежности (для GNN) или по наличию ограничений (для ACO)
-    adj = {u: [v for v in nodes if v != u] for u in nodes}
+    adj_sets = {u: set() for u in nodes}
+    for (u, v) in capacities.keys():
+        adj_sets[u].add(v)
+
+    adj = {u: list(adj_sets[u]) for u in adj_sets}
 
     return nodes, destinations, adj, capacities, requests
