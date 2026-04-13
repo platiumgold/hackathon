@@ -54,9 +54,10 @@ def draw_heatmap(nodes, adj, capacities, final_load):
         nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, font_size=7, ax=ax)
 
     # Show Custom Legend
-    ax.legend(scatterpoints=1, loc='upper right', bbox_to_anchor=(1.2, 1.0))
+    ax.legend(scatterpoints=1, loc='upper left', bbox_to_anchor=(1.0, 1.0))
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=0, vmax=1))
-    fig.colorbar(sm, ax=ax, label='Уровень загрузки участка')
+    fig.colorbar(sm, ax=ax, label='Уровень загрузки участка', pad=0.05, shrink=0.7, anchor=(0.0, 0.0))
+    plt.tight_layout()
     ax.axis('off')
 
     return fig
