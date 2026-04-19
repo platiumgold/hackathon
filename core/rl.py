@@ -1,255 +1,340 @@
 import numpy as np
-import copy
-from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions import Categorical
+from torch.distributions import Normal
+import networkx as nx
+from itertools import islice
+from collections import defaultdict
+
 
 class PPOAgent(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=128):
+    """
+    Агент PPO (Proximal Policy Optimization) для задачи маршрутизации.
+    Оценивает состояние сети и выдает изменения (deltas) для логитов путей.
+    """
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
         super(PPOAgent, self).__init__()
-        self.actor = nn.Sequential(
+        self.actor_mean = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, action_dim)
         )
+        # Обучаемое стандартное отклонение (начинаем с меньшей дисперсии для стабильности)
+        self.actor_log_std = nn.Parameter(torch.ones(1, action_dim) * -0.5)
+        
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, state):
-        probs = self.actor(state)
+        mean = self.actor_mean(state)
+        log_std = self.actor_log_std.expand_as(mean)
+        std = torch.exp(log_std)
         value = self.critic(state)
-        return probs, value
+        return mean, std, value
 
-def run_rl(nodes, dests, adj, caps, reqs, epochs=1000, gamma=0.99, lr=3e-4, clip_ratio=0.2):
-    """
-    Solves the energy routing problem using Proximal Policy Optimization (PPO).
-    """
-    node_idx = {n: i for i, n in enumerate(nodes)}
-    idx_node = {i: n for i, n in enumerate(nodes)}
-    num_nodes = len(nodes)
 
-    # Process edges
-    edge_list = []
-    edge_idx = {}
-    idx_edge = {}
-    for i, u in enumerate(nodes):
+class PowerRoutingEnv:
+    """
+    Среда обучения (MDP) для последовательной корректировки потоков.
+    Агент делает T шагов, корректируя распределение потоков по путям.
+    """
+    def __init__(self, nodes, caps, req_list, paths_per_req, K_paths, max_steps=10):
+        self.nodes = nodes
+        self.caps = caps
+        self.req_list = req_list
+        self.paths_per_req = paths_per_req
+        self.K_paths = K_paths
+        self.max_steps = max_steps
+        
+        self.edges = list(caps.keys())
+        self.edge_idx = {e: i for i, e in enumerate(self.edges)}
+        self.num_edges = len(self.edges)
+        self.cap_arr = np.array([caps.get(e, 1e-5) for e in self.edges])
+        self.num_reqs = len(req_list)
+        
+        self.step_count = 0
+        self.logits = np.zeros((self.num_reqs, self.K_paths))
+        self.current_delivered = 0.0
+        self.edge_loads = np.zeros(self.num_edges)
+
+    def reset(self):
+        self.step_count = 0
+        # Инициализация равными вероятностями
+        self.logits = np.zeros((self.num_reqs, self.K_paths))
+        self.current_delivered, self.edge_loads = self._evaluate_flow(self.logits)
+        return self._get_state()
+
+    def step(self, action):
+        """ Применение действия агента (изменение логитов) """
+        # action shape is (num_reqs * K_paths)
+        action = action.reshape((self.num_reqs, self.K_paths))
+        self.logits += action
+        self.step_count += 1
+        
+        new_delivered, new_edge_loads = self._evaluate_flow(self.logits)
+        
+        # Награда: приращение доставленной энергии
+        reward = new_delivered - self.current_delivered
+        
+        self.current_delivered = new_delivered
+        self.edge_loads = new_edge_loads
+        
+        done = (self.step_count >= self.max_steps)
+        return self._get_state(), reward, done, {}
+
+    def _get_probs(self, logits):
+        max_logits = np.max(logits, axis=1, keepdims=True)
+        exp_L = np.exp(logits - max_logits)
+        return exp_L / np.sum(exp_L, axis=1, keepdims=True)
+
+    def _evaluate_flow(self, logits):
+        """ 
+        Симуляция среды: вычисление реальной доставки энергии с учетом 
+        пропорциональных ограничений сети при перегрузке.
+        """
+        probs = self._get_probs(logits)
+        
+        # 1. Расчет запрашиваемых (attempted) нагрузок на линии
+        edge_loads = np.zeros(self.num_edges)
+        for r in range(self.num_reqs):
+            req_amount = self.req_list[r]['amount']
+            for k in range(len(self.paths_per_req[r])):
+                flow = probs[r, k] * req_amount
+                path = self.paths_per_req[r][k]
+                for i in range(len(path)-1):
+                    e = (path[i], path[i+1])
+                    if e in self.edge_idx:
+                        edge_loads[self.edge_idx[e]] += flow
+                        
+        # 2. Применение жесткого пропорционального отсечения
+        total_delivered = 0.0
+        for r in range(self.num_reqs):
+            req_amount = self.req_list[r]['amount']
+            for k in range(len(self.paths_per_req[r])):
+                flow = probs[r, k] * req_amount
+                if flow <= 0: continue
+                
+                allowed_ratio = 1.0
+                path = self.paths_per_req[r][k]
+                # Поиск "бутылочного горлышка" (наименьшего отношения cap / load) на маршруте
+                for i in range(len(path)-1):
+                    e = (path[i], path[i+1])
+                    if e in self.edge_idx:
+                        e_idx = self.edge_idx[e]
+                        if edge_loads[e_idx] > self.cap_arr[e_idx]:
+                            ratio = self.cap_arr[e_idx] / edge_loads[e_idx]
+                            if ratio < allowed_ratio:
+                                allowed_ratio = ratio
+                
+                total_delivered += flow * allowed_ratio
+                
+        return total_delivered, edge_loads
+
+    def _get_state(self):
+        """ Формирование вектора состояния для нейросети """
+        # Нормализованная загрузка линий
+        norm_loads = self.edge_loads / (self.cap_arr + 1e-5)
+        # Текущие вероятности выбора путей
+        probs = self._get_probs(self.logits).flatten()
+        return np.concatenate([norm_loads, probs]).astype(np.float32)
+
+    def get_final_flows(self):
+        """ Возвращает финальное распределение для интерфейса пользователя """
+        probs = self._get_probs(self.logits)
+        
+        edge_loads = np.zeros(self.num_edges)
+        for r in range(self.num_reqs):
+            req_amount = self.req_list[r]['amount']
+            for k in range(len(self.paths_per_req[r])):
+                flow = probs[r, k] * req_amount
+                path = self.paths_per_req[r][k]
+                for i in range(len(path)-1):
+                    e = (path[i], path[i+1])
+                    if e in self.edge_idx:
+                        edge_loads[self.edge_idx[e]] += flow
+                        
+        delivered_dict = {}
+        load_distribution = defaultdict(float)
+        
+        for r in range(self.num_reqs):
+            src = self.req_list[r]['src']
+            dst = self.req_list[r]['dst']
+            req_amount = self.req_list[r]['amount']
+            delivered_r = 0.0
+            
+            for k in range(len(self.paths_per_req[r])):
+                flow = probs[r, k] * req_amount
+                if flow <= 0: continue
+                
+                allowed_ratio = 1.0
+                path = self.paths_per_req[r][k]
+                for i in range(len(path)-1):
+                    e = (path[i], path[i+1])
+                    if e in self.edge_idx:
+                        e_idx = self.edge_idx[e]
+                        if edge_loads[e_idx] > self.cap_arr[e_idx]:
+                            ratio = self.cap_arr[e_idx] / edge_loads[e_idx]
+                            if ratio < allowed_ratio:
+                                allowed_ratio = ratio
+                
+                deliv = flow * allowed_ratio
+                delivered_r += deliv
+                
+                for i in range(len(path)-1):
+                    e = (path[i], path[i+1])
+                    load_distribution[e] += deliv
+                    
+            delivered_dict[(src, dst)] = delivered_dict.get((src, dst), 0.0) + delivered_r
+            
+        return {'load_distribution': dict(load_distribution), 'delivered': delivered_dict}
+
+
+def get_k_shortest_paths(G, source, target, k=3):
+    try:
+        paths = list(islice(nx.shortest_simple_paths(G, source, target), k))
+        return paths
+    except nx.NetworkXNoPath:
+        return []
+
+
+def run_rl(nodes, dests, adj, caps, reqs, epochs=200, K_paths=3, gamma=0.99, lr=3e-4):
+    """
+    Главная функция запуска Deep RL (PPO).
+    Создает среду и обучает агента управлять потоками.
+    """
+    G = nx.DiGraph()
+    for u in nodes:
         for v in adj.get(u, []):
-            if v in nodes:
-                j = node_idx[v]
-                edge_list.append((i, j))
-                idx = len(edge_list) - 1
-                edge_idx[(i, j)] = idx
-                idx_edge[idx] = (i, j)
-    num_edges = len(edge_list)
+            cap = caps.get((u, v), 1.0)
+            G.add_edge(u, v, capacity=cap)
 
-    # Processing requests
     req_list = []
+    paths_per_req = []
+
     for (src, dst), amount in reqs.items():
         if src in nodes and dst in nodes:
-            req_list.append((node_idx[src], node_idx[dst], amount))
+            paths = get_k_shortest_paths(G, src, dst, k=K_paths)
+            if paths:
+                # Паддинг путей, если их меньше K
+                while len(paths) < K_paths:
+                    paths.append(paths[0])
+                req_list.append({'src': src, 'dst': dst, 'amount': amount})
+                paths_per_req.append(paths)
 
-    state_dim = num_edges # Current loads on edges
-    # Action dimension: for each request, we want to pick a path.
-    # To keep it simple, we generate a probability distribution over edges.
-    # The action is a continuous vector of size num_edges, representing flow allocations.
+    num_requests = len(req_list)
+    if num_requests == 0:
+        return {'load_distribution': {}, 'delivered': {}}
 
-    # We will use a simplified RL approach:
-    # State: current edge remaining capacities
-    action_dim = num_edges * len(req_list)
+    env = PowerRoutingEnv(nodes, caps, req_list, paths_per_req, K_paths, max_steps=8)
+    
+    state_dim = env.num_edges + env.num_reqs * K_paths
+    action_dim = env.num_reqs * K_paths
+    
+    agent = PPOAgent(state_dim, action_dim)
+    optimizer = optim.Adam(agent.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # A simple actor-critic based on direct flow optimization
-    # Actually, let's use a simpler heuristic with PPO:
-    # We parameterize the policy as a distribution over edges for routing.
+    best_total_delivered = -1
+    best_result = None
 
-    actor_critic = PPOAgent(state_dim, action_dim)
-    optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
-
-    # Normalize capacities
-    max_cap = 1.0
-    if caps:
-        max_cap = max(caps.values())
-
-    capacity_arr = np.zeros(num_edges)
-    for (u, v), c in caps.items():
-        if u in node_idx and v in node_idx:
-            if (node_idx[u], node_idx[v]) in edge_idx:
-                capacity_arr[edge_idx[(node_idx[u], node_idx[v])]] = c
-
-    # Training loop
-    best_load_distribution = {}
-    best_delivered = {}
-    best_reward = -float('inf')
-
+    # Цикл обучения PPO
     for epoch in range(epochs):
-        state = np.copy(capacity_arr) / max_cap # Normalized remaining capacity
+        states, actions, log_probs, rewards, values, dones = [], [], [], [], [], []
+        state = env.reset()
+        
+        # Сбор траектории
+        for t in range(env.max_steps):
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)
+            with torch.no_grad():
+                mean, std, value = agent(state_tensor)
+                dist = Normal(mean, std)
+                action = dist.sample()
+                log_prob = dist.log_prob(action).sum(dim=-1)
+            
+            action_np = action.squeeze(0).numpy()
+            next_state, reward, done, _ = env.step(action_np)
+            
+            states.append(state)
+            actions.append(action_np)
+            log_probs.append(log_prob.item())
+            rewards.append(reward)
+            values.append(value.item())
+            dones.append(done)
+            
+            state = next_state
+            
+            # Сохранение лучшего найденного решения
+            if env.current_delivered > best_total_delivered:
+                best_total_delivered = env.current_delivered
+                best_result = env.get_final_flows()
+                
+        # GAE (Generalized Advantage Estimation)
+        returns = []
+        advantages = []
+        gae = 0
+        lam = 0.95
+        
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
-
-        probs, value = actor_critic(state_tensor)
-
-        # We interpret probs as weights for flow paths
-        weights = probs.squeeze(0).reshape(len(req_list), num_edges)
-
-        current_loads = np.zeros(num_edges)
-        delivered = {req: 0.0 for req in range(len(req_list))}
-        requested_flows = np.zeros((len(req_list), num_edges))
-
-        reward = 0
-        penalty = 0
-
-        # Create copies of remaining amounts
-        remaining = [amount for _, _, amount in req_list]
-        initial_amounts = [amount for _, _, amount in req_list]
-
-        # We process in small steps to approximate proportional fair sharing and allow multiple paths
-        num_steps = 10
-
-        for step in range(num_steps):
-            step_requests = []
-            for k in range(len(req_list)):
-                if remaining[k] > 1e-5:
-                    step_requests.append(k)
-
-            if not step_requests:
-                break
-
-            # For each active request, find the shortest path based on current weights
-            paths = {}
-            for k in step_requests:
-                s, d, _ = req_list[k]
-
-                dist = {i: float('inf') for i in range(num_nodes)}
-                prev = {i: None for i in range(num_nodes)}
-                prev_edge = {i: None for i in range(num_nodes)}
-                dist[s] = 0
-
-                w_k = weights[k].detach().numpy() + 1e-6
-                cost = -np.log(w_k)
-                # Add penalty for congested edges to encourage alternative paths
-                for e in range(num_edges):
-                    if current_loads[e] >= capacity_arr[e] - 1e-5:
-                        cost[e] += 1000.0 # Huge penalty if edge is full
-
-                for _ in range(num_nodes - 1):
-                    for e_idx, (u, v) in idx_edge.items():
-                        if dist[u] + cost[e_idx] < dist[v]:
-                            dist[v] = dist[u] + cost[e_idx]
-                            prev[v] = u
-                            prev_edge[v] = e_idx
-
-                if dist[d] < 500.0: # Path found without using fully congested edges
-                    curr = d
-                    path_edges = []
-                    valid = True
-                    while curr != s:
-                        e = prev_edge[curr]
-                        if e is None:
-                            valid = False
-                            break
-                        path_edges.append(e)
-                        curr = prev[curr]
-
-                    if valid and curr == s:
-                        paths[k] = path_edges
-
-            # Now we have paths for requests. We want to route a fraction of their remaining demand.
-            # But we must respect edge capacities strictly and reduce proportionally if congested.
-
-            # The maximum we try to route in this step for each request
-            step_fractions = {k: remaining[k] / (num_steps - step) for k in paths}
-
-            # Calculate desired load on each edge in this step
-            desired_edge_loads = defaultdict(float)
-            for k, edges in paths.items():
-                for e in edges:
-                    desired_edge_loads[e] += step_fractions[k]
-
-            # Find the scaling factor for each request to not exceed any edge capacity
-            scaling_factors = {k: 1.0 for k in paths}
-
-            # Check for congestion and apply proportional reduction
-            for e, desired in desired_edge_loads.items():
-                available = max(0.0, capacity_arr[e] - current_loads[e])
-                if desired > available:
-                    # In case of no available capacity, reduce proportionally
-                    # The task specifies proportional to initial amounts, but within this step,
-                    # we reduce proportionally to their requested flow in this step (which traces back to remaining).
-                    # Actually, let's strictly weight by initial_amounts
-                    total_initial = sum(initial_amounts[k] for k, edges in paths.items() if e in edges)
-
-                    for k, edges in paths.items():
-                        if e in edges:
-                            # Fair share for this request on this edge
-                            fair_share = available * (initial_amounts[k] / total_initial if total_initial > 0 else 0)
-                            # Maximum scaling factor we can allow for this request
-                            allowed_factor = fair_share / step_fractions[k] if step_fractions[k] > 0 else 0
-                            if allowed_factor < scaling_factors[k]:
-                                scaling_factors[k] = allowed_factor
-
-            # Apply the routed amounts
-            for k, edges in paths.items():
-                actual_route_amount = step_fractions[k] * scaling_factors[k]
-                if actual_route_amount > 0:
-                    for e in edges:
-                        current_loads[e] += actual_route_amount
-                        requested_flows[k, e] += actual_route_amount
-                    delivered[k] += actual_route_amount
-                    remaining[k] -= actual_route_amount
-                    reward += actual_route_amount
-
-        # Penalize overloads (although constrained logic prevents it, this helps if precision errors occur)
-        overload = np.maximum(0, current_loads - capacity_arr)
-        penalty = np.sum(overload) * 10
-        total_reward = reward - penalty
-
-        # --- Smart RL Update (Advantage Actor-Critic / PPO-style surrogate) ---
-        # Calculate Advantage using the Critic network to reduce variance
-        target_value = torch.tensor([total_reward], dtype=torch.float32)
-        critic_loss = nn.MSELoss()(value.view(-1), target_value)
-
-        advantage = total_reward - value.item()
-
-        # Actor Loss: Policy Gradient with Advantage
-        # We increase probabilities for paths used if advantage > 0 (result is better than expected),
-        # and penalize (decrease probabilities) if advantage < 0.
-        actor_loss = 0
-        for k in range(len(req_list)):
-            if delivered[k] > 0:
-                for e in range(num_edges):
-                    if requested_flows[k, e] > 0:
-                        # Maximize log prob scaled by advantage
-                        actor_loss -= torch.log(weights[k, e] + 1e-8) * advantage
-
-        # Combine losses and update
-        if isinstance(actor_loss, torch.Tensor):
-            loss = actor_loss + 0.5 * critic_loss
+        with torch.no_grad():
+            _, _, next_val = agent(state_tensor)
+            next_val = next_val.item()
+            
+        for i in reversed(range(len(rewards))):
+            if i == len(rewards) - 1:
+                next_non_terminal = 1.0 - dones[i]
+                next_value = next_val
+            else:
+                next_non_terminal = 1.0 - dones[i]
+                next_value = values[i+1]
+                
+            delta = rewards[i] + gamma * next_value * next_non_terminal - values[i]
+            gae = delta + gamma * lam * next_non_terminal * gae
+            advantages.insert(0, gae)
+            returns.insert(0, gae + values[i])
+            
+        states_t = torch.FloatTensor(np.array(states))
+        actions_t = torch.FloatTensor(np.array(actions))
+        old_log_probs_t = torch.FloatTensor(np.array(log_probs))
+        returns_t = torch.FloatTensor(np.array(returns))
+        advantages_t = torch.FloatTensor(np.array(advantages))
+        
+        # Нормализация advantages
+        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+        
+        # Обновление PPO (K эпох)
+        for _ in range(4):
+            mean, std, value = agent(states_t)
+            dist = Normal(mean, std)
+            new_log_probs = dist.log_prob(actions_t).sum(dim=-1)
+            ratio = torch.exp(new_log_probs - old_log_probs_t)
+            
+            surr1 = ratio * advantages_t
+            surr2 = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2) * advantages_t
+            actor_loss = -torch.min(surr1, surr2).mean()
+            
+            critic_loss = nn.MSELoss()(value.squeeze(-1), returns_t)
+            entropy = dist.entropy().mean()
+            
+            # Общий loss (поощряем энтропию для исследования)
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+            
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
             optimizer.step()
+            
+        scheduler.step()
 
-        if total_reward > best_reward:
-            best_reward = total_reward
-            best_load_distribution = {}
-            for e_idx in range(num_edges):
-                if current_loads[e_idx] > 0:
-                    u, v = idx_edge[e_idx]
-                    best_load_distribution[(idx_node[u], idx_node[v])] = current_loads[e_idx]
-
-            best_delivered = {}
-            for k, (s, d, amount) in enumerate(req_list):
-                if delivered[k] > 0:
-                    best_delivered[(idx_node[s], idx_node[d])] = delivered[k]
-
-    return {
-        'load_distribution': best_load_distribution,
-        'delivered': best_delivered
-    }
+    return best_result if best_result else {'load_distribution': {}, 'delivered': {}}
