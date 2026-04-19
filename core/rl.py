@@ -206,6 +206,7 @@ def get_k_shortest_paths(G, source, target, k=3):
 
 def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr=3e-4):
     G = nx.DiGraph()
+    G.add_nodes_from(nodes)
     for u in nodes:
         for v in adj.get(u, []):
             cap = caps.get((u, v), 1.0)
