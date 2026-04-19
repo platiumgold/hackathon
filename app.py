@@ -57,7 +57,7 @@ if st.sidebar.button("🚀 Запустить расчет"):
                             final_load[(nodes[u], nodes[v])] = total_edges[u, v].item()
 
             elif algo == "Reinforcement Learning (PPO)":
-                res = run_rl(nodes, dests, adj, caps, reqs, epochs=200)
+                res = run_rl(nodes, dests, adj, caps, reqs)
                 final_load = res['load_distribution']
                 total_delivered = sum(res['delivered'].values())
 
