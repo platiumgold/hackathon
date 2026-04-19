@@ -216,14 +216,18 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr
     paths_per_req = []
 
     for (src, dst), amount in reqs.items():
-        if src in nodes and dst in nodes:
+        if src in G.nodes and dst in G.nodes:
             paths = get_k_shortest_paths(G, src, dst, k=K_paths)
+            
             if paths:
                 actual_k = len(paths)
                 while len(paths) < K_paths:
                     paths.append([])
                 req_list.append({'src': src, 'dst': dst, 'amount': amount, 'actual_k': actual_k})
                 paths_per_req.append(paths)
+        else:
+            # Node not in graph - skip or handle as zero-flow request
+            continue
 
     num_requests = len(req_list)
     if num_requests == 0:
