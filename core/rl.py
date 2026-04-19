@@ -13,7 +13,7 @@ class PPOAgent(nn.Module):
     Агент PPO (Proximal Policy Optimization) для задачи маршрутизации.
     Оценивает состояние сети и выдает изменения (deltas) для логитов путей.
     """
-    def __init__(self, state_dim, action_dim, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(PPOAgent, self).__init__()
         self.actor_mean = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -209,7 +209,7 @@ def get_k_shortest_paths(G, source, target, k=3):
         return []
 
 
-def run_rl(nodes, dests, adj, caps, reqs, epochs=200, K_paths=3, gamma=0.99, lr=3e-4):
+def run_rl(nodes, dests, adj, caps, reqs, epochs=1000, K_paths=5, gamma=0.99, lr=3e-4):
     """
     Главная функция запуска Deep RL (PPO).
     Создает среду и обучает агента управлять потоками.
