@@ -2,8 +2,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
-import math
-
+from core.data_loader import TOPOLOGY_POS
 
 def draw_heatmap(nodes, adj, capacities, final_load):
     G = nx.DiGraph()
@@ -11,53 +10,71 @@ def draw_heatmap(nodes, adj, capacities, final_load):
         for v in adj[u]:
             G.add_edge(u, v, capacity=capacities.get((u, v), 0))
 
-    pos = {node: (5 * math.cos(2 * math.pi * i / len(nodes)), 5 * math.sin(2 * math.pi * i / len(nodes)))
-           for i, node in enumerate(nodes)}
+    # --- ОПРЕДЕЛЕНИЕ КООРДИНАТ (СХЕМАТИЧНЫЙ ЛЕЙАУТ) ---
+    # Мы используем централизованные координаты из data_loader.py
+    pos = {}
+    for node in nodes:
+        if node in TOPOLOGY_POS:
+            pos[node] = TOPOLOGY_POS[node]
+        else:
+            # Ищем, к какому узлу подключен этот потребитель
+            parent = None
+            for (u, v) in capacities.keys():
+                if v == node:
+                    parent = u
+                    break
+            
+            if parent and parent in TOPOLOGY_POS:
+                px, py = TOPOLOGY_POS[parent]
+                offset = 1.0
+                try:
+                    val = int(node)
+                    pos[node] = (px + offset * 0.5, py - offset) # Смещение вниз
+                except ValueError:
+                    pos[node] = (px + offset, py - offset)
+            else:
+                pos[node] = (0, 0)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_title("Тепловая карта загрузки распределительной сети", fontsize=14)
+    # --------------------------------------------------
 
-    # Determine node types based on typical naming conventions from the image
+    fig, ax = plt.subplots(figsize=(14, 9))
+    ax.set_title("⚡ Тепловая карта распределения потоков (Схематичный вид)", fontsize=16, fontweight='bold', pad=20)
+
     sources, consumers, connectors = [], [], []
     for n in nodes:
         if str(n).isalpha() and len(str(n)) == 1:
             sources.append(n)
-        elif str(n).isdigit():
+        elif str(n).isdigit() or (str(n).endswith('.') and str(n)[:-1].isdigit()):
             consumers.append(n)
         else:
             connectors.append(n)
 
-    # Draw sources as purple squares
-    nx.draw_networkx_nodes(G, pos, nodelist=sources, node_shape='s', node_color='purple', node_size=800, edgecolors='black', ax=ax, label="Источник потока")
-    # Draw consumers as blue circles
-    nx.draw_networkx_nodes(G, pos, nodelist=consumers, node_shape='o', node_color='dodgerblue', node_size=800, edgecolors='black', ax=ax, label="Потребитель потока")
-    # Draw connection nodes as red circles
-    nx.draw_networkx_nodes(G, pos, nodelist=connectors, node_shape='o', node_color='tomato', node_size=800, edgecolors='black', ax=ax, label="Узел соединения потоков")
+    # Отрисовка узлов
+    nx.draw_networkx_nodes(G, pos, nodelist=sources, node_shape='s', node_color='purple', node_size=700, edgecolors='black', ax=ax, label="Источники (A-P)")
+    nx.draw_networkx_nodes(G, pos, nodelist=consumers, node_shape='o', node_color='dodgerblue', node_size=500, edgecolors='black', ax=ax, label="Потребители (1-38)")
+    nx.draw_networkx_nodes(G, pos, nodelist=connectors, node_shape='o', node_color='tomato', node_size=800, edgecolors='black', ax=ax, label="Узел связи (I.-XVIII.)")
 
-    nx.draw_networkx_labels(G, pos, font_size=10, font_color='white', font_weight='bold', ax=ax)
+    nx.draw_networkx_labels(G, pos, font_size=9, font_color='white', font_weight='bold', ax=ax)
 
     cmap = plt.colormaps['coolwarm']
     edges_to_draw, edge_colors, labels = [], [], {}
 
     for edge, cap in capacities.items():
         load = final_load.get(edge, 0.0)
-        if load >= 1.0:
-            ratio = min(load / cap, 1.0) if cap > 0 else 1.0
+        if load >= 0.1:
+            ratio = min(load / cap, 1.0) if cap > 0 else 0.0
             edges_to_draw.append(edge)
             edge_colors.append(cmap(ratio))
-            labels[edge] = f"{load:.3f}/{cap:.3f}"  # Точность до 3 знаков (Требование 9.1.2)
+            labels[edge] = f"{load:.1f}"
 
     if edges_to_draw:
         nx.draw_networkx_edges(G, pos, edgelist=edges_to_draw, edge_color=edge_colors,
-                               width=2.5, arrowstyle='-|>', arrowsize=20, connectionstyle="arc3,rad=0.1", ax=ax,
-                               min_source_margin=15, min_target_margin=15)
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, font_size=7, ax=ax)
+                               width=2, arrowstyle='-|>', arrowsize=15, connectionstyle="arc3,rad=0.05", ax=ax)
 
-    # Show Custom Legend
-    ax.legend(scatterpoints=1, loc='upper left', bbox_to_anchor=(1.0, 1.0))
+    ax.legend(loc='upper right', bbox_to_anchor=(1.15, 1.0))
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=0, vmax=1))
-    fig.colorbar(sm, ax=ax, label='Уровень загрузки участка', pad=0.05, shrink=0.7, anchor=(0.0, 0.0))
+    fig.colorbar(sm, ax=ax, label='Уровень загрузки участка (0.0 - 1.0)', pad=0.02, shrink=0.6)
+    
     plt.tight_layout()
     ax.axis('off')
-
     return fig
