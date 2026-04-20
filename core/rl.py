@@ -85,14 +85,19 @@ class PowerRoutingEnv:
         return self._get_state()
 
     def step(self, action):
-        # One-shot: действие — это прямые logits (не инкремент)
-        self.logits = action.reshape((self.num_reqs, self.K_paths))
+        # Инкрементальное действие: агент корректирует распределение
+        # Умножаем на 0.2, чтобы изменения были плавными и агент мог "нащупать" оптимум
+        action = action.reshape((self.num_reqs, self.K_paths))
+        self.logits += action * 0.2
+        
+        # Ограничиваем логиты, чтобы Softmax не "залипал" в экстремальных значениях
+        self.logits = np.clip(self.logits, -10.0, 10.0)
         self.step_count += 1
         
         new_metric, new_delivered, new_edge_loads, new_actual_flows = self._evaluate_flow(self.logits)
         
-        # Награда: абсолютное значение метрики (one-shot решение)
-        reward = new_metric
+        # Награда: насколько лучше стало по сравнению с предыдущим состоянием
+        reward = new_metric - self.current_metric
         
         self.current_metric = new_metric
         self.total_delivered = new_delivered
@@ -286,18 +291,18 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
 
     # Автоматический подбор гиперпараметров (Dynamic Scaling)
     complexity = len(caps) * num_requests
-    if complexity < 50:      # Очень простая сеть (например, базовая таблица 1.2)
-        auto_epochs = 50
-        batch_size = 64
-        max_steps = 1
+    if complexity < 50:      # Очень простая сеть
+        auto_epochs = 60
+        max_steps = 12
+        batch_size = max_steps * 10  # 120 шагов (10 эпизодов)
     elif complexity < 500:   # Средняя сеть
-        auto_epochs = 100
-        batch_size = 128
-        max_steps = 1
-    else:                    # Сложная сеть (eval_complex.py)
+        auto_epochs = 120
+        max_steps = 16
+        batch_size = max_steps * 16  # 256 шагов
+    else:                    # Сложная сеть
         auto_epochs = 200
-        batch_size = 256
-        max_steps = 1
+        max_steps = 20
+        batch_size = max_steps * 20  # 400 шагов
         
     # Если пользователь явно передал epochs, используем его, иначе авто
     epochs = epochs if epochs is not None else auto_epochs
