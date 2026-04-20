@@ -68,6 +68,16 @@ class PowerRoutingEnv:
         self.actual_flows = np.zeros((self.num_reqs, self.K_paths))
         self.total_delivered = 0.0
 
+        # Precompute edge-to-(req,path) mapping for fairness logic
+        self._edge_req_paths = defaultdict(list)
+        for r in range(self.num_reqs):
+            for k in range(self.req_list[r]['actual_k']):
+                path = self.paths_per_req[r][k]
+                for i in range(len(path) - 1):
+                    e = (path[i], path[i+1])
+                    if e in self.edge_idx:
+                        self._edge_req_paths[self.edge_idx[e]].append((r, k))
+
     def reset(self):
         self.step_count = 0
         self.logits = np.zeros((self.num_reqs, self.K_paths))
@@ -75,16 +85,14 @@ class PowerRoutingEnv:
         return self._get_state()
 
     def step(self, action):
-        action = action.reshape((self.num_reqs, self.K_paths))
-        self.logits += action
-        # Предотвращаем взрыв логитов (Исчезающий градиент Softmax)
-        self.logits = np.clip(self.logits, -10.0, 10.0)
+        # One-shot: действие — это прямые logits (не инкремент)
+        self.logits = action.reshape((self.num_reqs, self.K_paths))
         self.step_count += 1
         
         new_metric, new_delivered, new_edge_loads, new_actual_flows = self._evaluate_flow(self.logits)
         
-        # Награда: приращение интегральной метрики (throughput - penalty)
-        reward = new_metric - self.current_metric
+        # Награда: абсолютное значение метрики (one-shot решение)
+        reward = new_metric
         
         self.current_metric = new_metric
         self.total_delivered = new_delivered
@@ -124,24 +132,66 @@ class PowerRoutingEnv:
                             edge_loads[self.edge_idx[e]] += flow
                             
             overloaded = False
-            path_ratios = np.ones((self.num_reqs, self.K_paths))
+            scaling = np.ones((self.num_reqs, self.K_paths))
             
-            for r in range(self.num_reqs):
-                for k in range(self.req_list[r]['actual_k']):
-                    path = self.paths_per_req[r][k]
-                    min_ratio = 1.0
-                    for i in range(len(path)-1):
-                        e = (path[i], path[i+1])
-                        if e in self.edge_idx:
-                            e_idx = self.edge_idx[e]
-                            if edge_loads[e_idx] > self.cap_arr[e_idx] + 1e-4:
-                                overloaded = True
-                                ratio = self.cap_arr[e_idx] / edge_loads[e_idx]
-                                if ratio < min_ratio:
-                                    min_ratio = ratio
-                    path_ratios[r, k] = min_ratio
+            for e_idx in range(self.num_edges):
+                if edge_loads[e_idx] <= self.cap_arr[e_idx] + 1e-4:
+                    continue
+                
+                overloaded = True
+                cap = self.cap_arr[e_idx]
+                
+                # Группируем потоки по запросам на этом ребре
+                req_flow_on_edge = defaultdict(float)
+                req_paths_on_edge = defaultdict(list)
+                
+                for (r, k) in self._edge_req_paths[e_idx]:
+                    flow = actual_flows[r, k]
+                    if flow > 0:
+                        req_flow_on_edge[r] += flow
+                        req_paths_on_edge[r].append(k)
+                
+                if not req_flow_on_edge:
+                    continue
+                
+                # Water-filling: пропорционально исходным заявкам,
+                # но неиспользованная мощность перераспределяется
+                remaining_cap = cap
+                uncapped = set(req_flow_on_edge.keys())
+                final_alloc = {}
+                
+                while uncapped and remaining_cap > 1e-6:
+                    total_demand_uncapped = sum(self.req_list[r]['amount'] for r in uncapped)
+                    if total_demand_uncapped <= 0:
+                        break
+                    
+                    # Находим запросы, которым хватает их доли
+                    fitted = set()
+                    for r in uncapped:
+                        share = remaining_cap * (self.req_list[r]['amount'] / total_demand_uncapped)
+                        if req_flow_on_edge[r] <= share + 1e-6:
+                            final_alloc[r] = req_flow_on_edge[r]
+                            fitted.add(r)
+                    
+                    if not fitted:
+                        # Все оставшиеся превышают свою долю — режем пропорционально
+                        for r in uncapped:
+                            final_alloc[r] = remaining_cap * (self.req_list[r]['amount'] / total_demand_uncapped)
+                        break
+                    
+                    for r in fitted:
+                        remaining_cap -= final_alloc[r]
+                        uncapped.remove(r)
+                
+                # Применяем масштабирование
+                for r, alloc in final_alloc.items():
+                    actual = req_flow_on_edge[r]
+                    if actual > alloc + 1e-6:
+                        local_scale = alloc / actual
+                        for k in req_paths_on_edge[r]:
+                            scaling[r, k] = min(scaling[r, k], local_scale)
             
-            actual_flows *= path_ratios
+            actual_flows *= scaling
             
             if not overloaded:
                 break
@@ -204,7 +254,7 @@ def get_k_shortest_paths(G, source, target, k=3):
         return []
 
 
-def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr=3e-4):
+def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, lr=3e-4):
     G = nx.DiGraph()
     G.add_nodes_from(nodes)
     for u in nodes:
@@ -225,9 +275,10 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr
                     paths.append([])
                 req_list.append({'src': src, 'dst': dst, 'amount': amount, 'actual_k': actual_k})
                 paths_per_req.append(paths)
+            else:
+                print(f"⚠️ RL: Нет пути {src} → {dst} ({amount} кВт) — пропущено")
         else:
-            # Node not in graph - skip or handle as zero-flow request
-            continue
+            print(f"⚠️ RL: Узел не в графе: {src} → {dst} ({amount} кВт) — пропущено")
 
     num_requests = len(req_list)
     if num_requests == 0:
@@ -237,16 +288,16 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr
     complexity = len(caps) * num_requests
     if complexity < 50:      # Очень простая сеть (например, базовая таблица 1.2)
         auto_epochs = 50
-        batch_size = 32
-        max_steps = 8
+        batch_size = 64
+        max_steps = 1
     elif complexity < 500:   # Средняя сеть
         auto_epochs = 100
         batch_size = 128
-        max_steps = 16
+        max_steps = 1
     else:                    # Сложная сеть (eval_complex.py)
         auto_epochs = 200
         batch_size = 256
-        max_steps = 32
+        max_steps = 1
         
     # Если пользователь явно передал epochs, используем его, иначе авто
     epochs = epochs if epochs is not None else auto_epochs
@@ -267,6 +318,7 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr
     best_metric_val = -float('inf')
     best_result = None
     best_delivered_kwt = 0.0
+    no_improvement_count = 0
     
     state = env.reset()
 
@@ -307,10 +359,17 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=5, gamma=0.99, lr
             if eval_done:
                 break
                 
-        if eval_env.current_metric > best_metric_val:
+        if eval_env.current_metric > best_metric_val + 1e-6:
             best_metric_val = eval_env.current_metric
             best_result = eval_env.get_final_flows()
             best_delivered_kwt = eval_env.total_delivered
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+
+        if no_improvement_count >= 20:
+            print(f"--- Ранняя остановка на эпохе {epoch} (результат стабилизировался) ---")
+            break
                 
         # 3. Обновление PPO (GAE)
         returns = []

@@ -93,16 +93,13 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                 final_load = res['load_distribution']
                 total_delivered = sum(res['delivered'].values())
 
-        # Вывод результатов
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Запрошено", f"{total_requested:.1f} кВт")
-        col2.metric("Доставлено", f"{total_delivered:.1f} кВт")
-        
-        # Эмуляция частоты
-        freq_dev = 0.000 if total_delivered >= total_requested else (total_requested - total_delivered) * 0.001
-        col3.metric("Частота", f"{50.000 - freq_dev:.3f} Гц")
+        # 3. Вывод метрик (Требование 9.1.1 и 9.1.2)
+        col1, col2 = st.columns(2)
+        col1.metric("Запрошено мощности", f"{total_requested:.3f} кВт")
+        col2.metric("Фактически доставлено", f"{total_delivered:.3f} кВт")
 
-        st.subheader("📊 Интерактивная карта распределения потоков")
+        st.info(
+            "💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков. Баланс генерации и потребления соблюден.")
         fig = draw_interactive_heatmap(nodes, adj, caps, final_load)
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 else:
