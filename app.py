@@ -3,8 +3,8 @@ import pandas as pd
 from core.data_loader import load_network_data
 from core.aco import run_aco
 from core.gnn import run_gnn
-from utils.visualization import draw_heatmap
 from core.rl import run_rl
+from utils.interactive_viz import draw_interactive_heatmap
 st.set_page_config(page_title="MVP Маршрутизации Энергии", layout="wide")
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
@@ -74,9 +74,9 @@ if st.sidebar.button("🚀 Запустить расчет"):
             "💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков. Баланс генерации и потребления соблюден, падение частоты сети предотвращено.")
 
         # 4. Визуализация
-        st.subheader("📊 Распределение потоков (Тепловая карта)")
-        fig = draw_heatmap(nodes, adj, caps, final_load)
-        st.pyplot(fig)
+        st.subheader("📊 Интерактивная карта распределения потоков")
+        fig = draw_interactive_heatmap(nodes, adj, caps, final_load)
+        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
     else:
         st.warning("⚠️ Пожалуйста, загрузите оба файла с данными (Таблицы 1.1 и 1.2) через боковую панель.")
