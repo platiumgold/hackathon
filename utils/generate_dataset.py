@@ -1,64 +1,55 @@
 import random
-import networkx as nx
 import pandas as pd
+from core.data_loader import BASE_TOPOLOGY, TOPOLOGY_POS
 
-def generate_and_save_csv(num_nodes=40, num_edges=120, num_reqs=30, req_filename="table_1_1_complex.csv", cap_filename="table_1_2_complex.csv"):
+def generate_synthetic_network(num_reqs=15, load_level=100.0, bottleneck_level=0.5):
     """
-    Генерирует сложный случайный связный граф сети и заявок, 
-    а затем сохраняет их в CSV файлы, совместимые с загрузчиком (app.py).
+    Генерирует данные на основе фиксированной топологии Альфа.
+    load_level: средняя мощность одной заявки (кВт)
+    bottleneck_level: 0.0 (без ограничений) до 1.0 (сильные ограничения)
     """
-    print(f"Generating network with ~{num_nodes} nodes, {num_edges} edges and {num_reqs} requests...")
     
-    # 1. Генерация графа
-    G = nx.gnm_random_graph(num_nodes, num_edges, directed=True)
+    # 1. Определяем списки узлов по типам
+    all_nodes = list(TOPOLOGY_POS.keys())
+    sources = [n for n in all_nodes if str(n).isalpha() and len(str(n)) == 1]
+    consumers = [n for n in all_nodes if str(n).isdigit()]
     
-    # Берем только самую большую связную компоненту, чтобы гарантировать пути
-    if not nx.is_weakly_connected(G):
-        components = sorted(nx.weakly_connected_components(G), key=len, reverse=True)
-        G = G.subgraph(components[0]).copy()
-        
-    nodes = [str(n) for n in G.nodes()]
-    
-    # 2. Формирование ограничений сети (Таблица 1.2)
-    cap_data = []
-    for u, v in G.edges():
-        u_str, v_str = str(u), str(v)
-        if u_str != v_str:
-            # Случайная допустимая мощность от 50 до 500 кВт
-            cap = round(random.uniform(50.0, 500.0), 2)
-            cap_data.append({"начало": u_str, "окончание": v_str, "Допустимая мощность": cap})
-            
-    # 3. Формирование заявок (Таблица 1.1)
+    # 2. Генерируем Таблицу 1.1 (Заявки)
     req_data = []
-    # Чтобы избежать дубликатов заявок между одними и теми же узлами, собираем в словарь
-    req_dict = {}
     for _ in range(num_reqs):
-        src = random.choice(nodes)
-        dst = random.choice(nodes)
-        while src == dst:
-            dst = random.choice(nodes)
-            
-        amount = round(random.uniform(20.0, 200.0), 2)
-        req_dict[(src, dst)] = req_dict.get((src, dst), 0) + amount
+        src = random.choice(sources)
+        dst = random.choice(consumers)
+        # Вариация потока +/- 50% от load_level
+        flow = round(load_level * random.uniform(0.5, 1.5), 1)
+        req_data.append([src, dst, flow])
+    
+    df_req = pd.DataFrame(req_data, columns=['Источник потока', 'Потребитель', 'Поток, кВт'])
+    
+    # 3. Генерируем Таблицу 1.2 (Ограничения)
+    # Выбираем случайное количество ребер из базовой топологии для наложения ограничений
+    # Чем выше bottleneck_level, тем больше ребер ограничиваем и тем меньше им даем мощности
+    cap_data = []
+    total_flow = df_req['Поток, кВт'].sum()
+    
+    # Ограничиваем от 20% до 80% всех ребер
+    num_limited_edges = int(len(BASE_TOPOLOGY) * (0.2 + 0.6 * bottleneck_level))
+    limited_edges = random.sample(BASE_TOPOLOGY, num_limited_edges)
+    
+    for u, v in limited_edges:
+        # Мощность ребра: если bottleneck_level высокий, то мощность будет близка к средней заявке
+        # Если низкий - то будет покрывать значительную часть общего потока
+        min_cap = load_level * 0.5
+        max_cap = total_flow * (1.1 - bottleneck_level)
+        cap = round(random.uniform(min_cap, max_cap), 1)
+        cap_data.append([u, v, cap])
         
-    for (src, dst), amount in req_dict.items():
-        req_data.append({"Источник потока": src, "Потребитель": dst, "Поток, кВт": round(amount, 2)})
-        
-    # 4. Сохранение в CSV
-    df_req = pd.DataFrame(req_data)
-    df_cap = pd.DataFrame(cap_data)
+    df_cap = pd.DataFrame(cap_data, columns=['начало', 'окончание', 'Допустимая мощность'])
     
-    # Сохраняем с разделителем запятая (стандарт) или точка с запятой
-    df_req.to_csv(req_filename, index=False, sep=",")
-    df_cap.to_csv(cap_filename, index=False, sep=",")
-    
-    total_power = sum([r["Поток, кВт"] for r in req_data])
-    
-    print(f"Successfully saved:")
-    print(f"  - Requests: {req_filename} ({len(req_data)} rows, total power: {total_power:.2f} kW)")
-    print(f"  - Network:  {cap_filename} ({len(cap_data)} edges)")
+    return df_req, df_cap
 
 if __name__ == "__main__":
-    # Фиксируем seed для повторяемости (можно убрать)
-    random.seed(42)
-    generate_and_save_csv(num_nodes=40, num_edges=120, num_reqs=30)
+    # Тестовый запуск
+    req, cap = generate_synthetic_network()
+    print(f"Generated {len(req)} requests and {len(cap)} constraints.")
+    req.to_csv("table_1_1_generated.csv", index=False)
+    cap.to_csv("table_1_2_generated.csv", index=False)
