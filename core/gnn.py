@@ -1,206 +1,130 @@
-import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 
 
-class PowerRoutingGNN(nn.Module):
-    def __init__(self, num_nodes, hidden_dim=64):
+class StrictEnergyGNN(nn.Module):
+    def __init__(self, num_nodes, embed_dim=16):
         super().__init__()
-        self.node_embeddings = nn.Embedding(num_nodes, hidden_dim)
+        self.num_nodes = num_nodes
+        # Эмбеддинги помогают сети понимать "соседство" узлов
+        self.node_embed = nn.Embedding(num_nodes, embed_dim)
 
-        # Легкие графовые свертки для понимания соседей
-        self.gcn1 = nn.Linear(hidden_dim, hidden_dim)
-        self.gcn2 = nn.Linear(hidden_dim, hidden_dim)
-
-        self.edge_predictor = nn.Sequential(
-            nn.Linear(hidden_dim * 4, 128),
-            nn.LayerNorm(128),
+        # Оценка ребер (кто я -> куда иду -> конечная цель)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 3, 32),
             nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            # Выдаем строго долю от 0 до 1
-            nn.Sigmoid()
+            nn.Linear(32, 1)
         )
 
-    def forward(self, cap_matrix, req_data, edge_pairs):
-        x = self.node_embeddings.weight
-        adj = (cap_matrix > 0).float()
+        # Оценка поглощения (нужно ли оставить энергию здесь)
+        self.sink_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
 
-        x = x + torch.relu(self.gcn1(torch.matmul(adj, x)))
-        x_combined = x + torch.relu(self.gcn2(torch.matmul(adj, x)))
+    def get_routing_matrices(self, adj_mask, dst_idx):
+        """Возвращает вероятности перехода для конкретного узла назначения"""
+        emb = self.node_embed.weight
+        dst_emb = emb[dst_idx].expand(self.num_nodes, -1)
 
-        R = len(req_data)
-        N = x_combined.shape[0]
-        E = len(edge_pairs)
+        # Считаем логиты для ребер
+        edge_logits = torch.full((self.num_nodes, self.num_nodes), -1e9)
+        for i in range(self.num_nodes):
+            # Векторизуем соседей для i
+            neighbors = torch.where(adj_mask[i] > 0)[0]
+            if len(neighbors) > 0:
+                e_in = torch.cat([
+                    emb[i].expand(len(neighbors), -1),
+                    emb[neighbors],
+                    dst_emb[neighbors]
+                ], dim=1)
+                edge_logits[i, neighbors] = self.edge_mlp(e_in).squeeze(-1)
 
-        if E == 0 or R == 0:
-            return torch.zeros((R, N, N), device=cap_matrix.device)
+        # Логиты поглощения
+        sink_input = torch.cat([emb, dst_emb], dim=1)
+        sink_logits = self.sink_mlp(sink_input).squeeze(-1)
 
-        u_idx = torch.tensor([u for u, v in edge_pairs], device=cap_matrix.device)
-        v_idx = torch.tensor([v for u, v in edge_pairs], device=cap_matrix.device)
-        src_idx = req_data[:, 0].long()
-        dst_idx = req_data[:, 1].long()
-        demands = req_data[:, 2]
+        # Softmax гарантирует, что сумма (выходные ребра + поглощение) = 1.0
+        combined = torch.cat([edge_logits, sink_logits.unsqueeze(1)], dim=1)
+        probs = torch.softmax(combined, dim=1)
 
-        ctx = torch.cat([
-            x_combined[u_idx].unsqueeze(0).expand(R, E, -1),
-            x_combined[v_idx].unsqueeze(0).expand(R, E, -1),
-            x_combined[src_idx].unsqueeze(1).expand(R, E, -1),
-            x_combined[dst_idx].unsqueeze(1).expand(R, E, -1)
-        ], dim=-1)
-
-        # Сеть предсказывает ДОЛЮ (0.0 - 1.0), а не киловатты
-        edge_fractions = self.edge_predictor(ctx).squeeze(-1)
-
-        # Умножаем долю на реальный спрос, получая физические киловатты
-        dem_t = demands.unsqueeze(1)
-        flows_e = edge_fractions * dem_t
-
-        # Запрет невозможных петель (в источник или из потребителя)
-        mask_u_is_dst = u_idx.unsqueeze(0) == dst_idx.unsqueeze(1)
-        mask_v_is_src = v_idx.unsqueeze(0) == src_idx.unsqueeze(1)
-        flows_e = flows_e.masked_fill(mask_u_is_dst | mask_v_is_src, 0.0)
-
-        flows = torch.zeros((R, N, N), device=cap_matrix.device)
-        for r in range(R):
-            flows[r, u_idx, v_idx] = flows_e[r]
-
-        return flows
+        return probs[:, :self.num_nodes], probs[:, self.num_nodes]
 
 
-def _set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _hard_capacity_scale_torch(flows: torch.Tensor, cap_matrix: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-    total_edges = flows.sum(dim=0)
-    eps_t = torch.tensor(eps, device=flows.device, dtype=flows.dtype)
-    scale_raw = cap_matrix / (total_edges + eps_t)
-
-    ones = torch.ones_like(total_edges)
-    scale = torch.where(total_edges > cap_matrix, scale_raw, ones)
-    scale = torch.where(cap_matrix > 0, scale, torch.zeros_like(scale))
-    return flows * scale.unsqueeze(0)
-
-
-def run_gnn(
-        nodes, capacities, requests, epochs=500, seed: int = 42,
-        cap_penalty_weight: float = 20.0,
-        proportionality_penalty_weight: float = 10.0
-):
-    _set_global_seed(seed)
-
+def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.01):
     num_nodes = len(nodes)
-    node_to_idx = {node: i for i, node in enumerate(nodes)}
-    requests_list = list(requests.items())
+    node_idx = {name: i for i, name in enumerate(nodes)}
+    req_list = list(requests.items())
+    num_reqs = len(req_list)
 
+    # Подготовка масок
+    adj_mask = torch.zeros((num_nodes, num_nodes))
     cap_matrix = torch.zeros((num_nodes, num_nodes))
-    for (u, v), cap in capacities.items():
-        cap_matrix[node_to_idx[u], node_to_idx[v]] = cap
+    for (u, v), cap in final_capacities.items():
+        if u in node_idx and v in node_idx:
+            adj_mask[node_idx[u], node_idx[v]] = 1.0
+            cap_matrix[node_idx[u], node_idx[v]] = float(cap)
 
-    edge_indices = torch.nonzero(cap_matrix > 0, as_tuple=False)
-    edge_pairs = [(int(i), int(j)) for i, j in edge_indices.tolist()]
+    model = StrictEnergyGNN(num_nodes)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    req_data = torch.tensor([
-        [node_to_idx[src], node_to_idx[dst], demand]
-        for ((src, dst), demand) in requests_list
-    ], dtype=torch.float32)
-
-    model = PowerRoutingGNN(num_nodes)
-    # Стабильный шаг обучения
-    optimizer = optim.AdamW(model.parameters(), lr=0.01)
-
-    print("\n" + "=" * 50)
-    print("🚀 СТАРТ GNN (Нормализованная стабильная физика)")
-    print("=" * 50)
-
-    R = len(requests_list)
-    src_idx = req_data[:, 0].long()
-    dst_idx = req_data[:, 1].long()
-    demands = req_data[:, 2]
-    batch_idx = torch.arange(R)
+    # Глубина графа для симуляции (сколько шагов может пройти ток)
+    max_steps = min(num_nodes, 10)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
+        total_loss = 0
+        all_req_flows = []
 
-        # Получаем сырые потоки
-        flows = model(cap_matrix, req_data, edge_pairs)
+        for r_idx, ((src, dst), demand) in enumerate(req_list):
+            s_i, d_i = node_idx[src], node_idx[dst]
+            P_edge, P_sink = model.get_routing_matrices(adj_mask, d_i)
 
-        in_f = flows.sum(dim=1)
-        out_f = flows.sum(dim=2)
-        delivered = torch.relu(in_f[batch_idx, dst_idx] - out_f[batch_idx, dst_idx])
+            current_dist = torch.zeros(num_nodes)
+            current_dist[s_i] = float(demand)
 
-        # ========================================================
-        # НОРМАЛИЗОВАННЫЕ ШТРАФЫ (Значения всегда в диапазоне ~0-10)
-        # ========================================================
+            req_flow_matrix = torch.zeros((num_nodes, num_nodes))
+            delivered = 0
 
-        # 1. Штраф доставки (Стремится к 0, когда доставлено = спрос)
-        delivery_ratio = delivered / (demands + 1e-5)
-        loss_dem = F.mse_loss(delivery_ratio, torch.ones_like(delivery_ratio)) * 10.0
+            for _ in range(max_steps):
+                step_flows = current_dist.unsqueeze(1) * P_edge
+                req_flow_matrix += step_flows
 
-        # 2. Штраф перегруза сети (В долях от вместимости трубы)
-        total_edges = flows.sum(dim=0)
-        cap_ratio = total_edges / (cap_matrix + 1e-5)
-        # Штрафуем только то, что превышает 1.0 (т.е. 100% вместимости)
-        overload = torch.relu(cap_ratio - 1.0)
-        loss_cap = overload.mean() * cap_penalty_weight
+                absorbed = current_dist * P_sink
+                delivered += absorbed[d_i]
 
-        # 3. Штраф Кирхгофа (Входящий ток должен равняться исходящему)
-        mask = torch.ones((R, num_nodes), dtype=torch.bool, device=flows.device)
-        mask[batch_idx, src_idx] = False
-        mask[batch_idx, dst_idx] = False
+                # Штраф за потерю энергии (поглощение не в целевом узле)
+                loss_waste = (absorbed.sum() - absorbed[d_i]) * 15.0
+                total_loss += loss_waste
 
-        # Нормализуем утечки относительно размера заявки
-        demands_exp = demands.unsqueeze(1).expand(-1, num_nodes)[mask] + 1e-5
-        transit_in = in_f[mask] / demands_exp
-        transit_out = out_f[mask] / demands_exp
-        loss_cons = F.mse_loss(transit_in, transit_out) * 5.0
+                current_dist = step_flows.sum(dim=0)
 
-        # 4. Штраф справедливости (Дисперсия долей доставки)
-        loss_fair = torch.var(delivery_ratio) * proportionality_penalty_weight
+            # Штраф за недоставку
+            total_loss += (float(demand) - delivered) * 20.0
+            all_req_flows.append(req_flow_matrix)
 
-        # Итоговый loss теперь состоит из маленьких чисел (например, 2.5 + 0.8 + 1.1)
-        # Взрыв градиентов математически невозможен.
-        loss = loss_dem + loss_cap + loss_cons + loss_fair
-        loss.backward()
+        # Штраф за перегрузку ЛЭП
+        total_flows = torch.stack(all_req_flows).sum(dim=0)
+        overflow = torch.relu(total_flows - cap_matrix)
+        total_loss += overflow.sum() * 10.0
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        total_loss.backward()
         optimizer.step()
 
-        if epoch % 50 == 0 or epoch == epochs - 1:
-            print(
-                f"Эпоха {epoch:3d} | Заявки: {demands.sum().item():.0f} | Доставлено: {delivered.sum().item():.0f} кВт "
-                f"| Loss Норм. Доставки: {loss_dem.item():.2f} | Loss Норм. Перегруза: {loss_cap.item():.2f}")
-
-    print("✅ ОБУЧЕНИЕ ЗАВЕРШЕНО\n")
-
-    # ========================================================
-    # ПОСТ-ПРОЦЕССИНГ (Жесткое приведение к физическим законам)
-    # ========================================================
+    # Финальный расчет результатов
     with torch.no_grad():
-        final_flows = model(cap_matrix, req_data, edge_pairs)
+        final_results = torch.zeros((num_reqs, num_nodes, num_nodes))
+        for r_idx, ((src, dst), demand) in enumerate(req_list):
+            s_i, d_i = node_idx[src], node_idx[dst]
+            P_edge, P_sink = model.get_routing_matrices(adj_mask, d_i)
 
-        # 1. Справедливое пропорциональное распределение дефицита в трубах
-        final_flows = _hard_capacity_scale_torch(final_flows, cap_matrix)
+            curr = torch.zeros(num_nodes)
+            curr[s_i] = float(demand)
+            for _ in range(max_steps):
+                step_f = curr.unsqueeze(1) * P_edge
+                final_results[r_idx] += step_f
+                curr = step_f.sum(dim=0)
 
-        # 2. Гарантия, что ни одна заявка не получит больше, чем просила
-        for req_idx in range(R):
-            d = dst_idx[req_idx]
-            dem = demands[req_idx].item()
-
-            in_d = final_flows[req_idx].sum(dim=0)[d]
-            out_d = final_flows[req_idx].sum(dim=1)[d]
-            delivered_val = (in_d - out_d).item()
-
-            if delivered_val > dem + 1e-4:
-                scale = dem / max(delivered_val, 1e-9)
-                final_flows[req_idx] *= scale
-
-    return final_flows, node_to_idx, requests_list
+    return final_results, node_idx, req_list

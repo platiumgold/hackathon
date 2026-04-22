@@ -1,45 +1,44 @@
 import plotly.graph_objects as go
-import networkx as nx
+import math
 from core.data_loader import TOPOLOGY_POS
+
 
 def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=None):
     fig = go.Figure()
 
-    # Вспомогательная функция для цвета
     def get_color(ratio):
-        # От синего (0%) через фиолетовый к красному (100%+)
         r = int(min(255, 255 * ratio))
         b = int(max(0, 255 * (1 - ratio)))
         return f'rgb({r}, 0, {b})'
 
-    # Списки для средних точек (чтобы на них вешать текст и hover)
-    mid_x = []
-    mid_y = []
-    mid_text = []
+    mid_x, mid_y, mid_text = [], [], []
 
-    # 1. Отрисовка ребер
+    # 1. Отрисовка ребер и стрелок
     for (u, v), cap in capacities.items():
         if u not in TOPOLOGY_POS or v not in TOPOLOGY_POS: continue
         x0, y0 = TOPOLOGY_POS[u]
         x1, y1 = TOPOLOGY_POS[v]
-        
-        t_load = total_load.get((u, v), 0.0) + total_load.get((v, u), 0.0)
-        s_load = (selected_load.get((u, v), 0.0) + selected_load.get((v, u), 0.0)) if selected_load is not None else t_load
-        
+
+        # Определяем направление перетока
+        flow_uv = total_load.get((u, v), 0.0)
+        flow_vu = total_load.get((v, u), 0.0)
+
+        t_load = flow_uv + flow_vu
+        s_load = (selected_load.get((u, v), 0.0) + selected_load.get((v, u),
+                                                                     0.0)) if selected_load is not None else t_load
+
         ratio = min(t_load / cap, 1.2) if cap > 0 else 0.0
-        
-        # Цвет всегда по ОБЩЕЙ нагрузке
         color = 'lightgrey' if t_load < 0.1 else get_color(ratio)
-        
-        # Толщина больше, если через ребро идет выбранная заявка
+
+        # Выравниваем размеры стрелок
         if selected_load is not None:
-            width = 6 if s_load > 0.1 else 1.5
+            width = 4 if s_load > 0.1 else 1.5
             opacity = 1.0 if s_load > 0.1 else 0.3
         else:
-            width = 4 if t_load > 0.1 else 1
+            width = 4 if t_load > 0.1 else 1.5
             opacity = 1.0
-        
-        # Добавляем саму линию
+
+        # Линия
         fig.add_trace(go.Scatter(
             x=[x0, x1, None], y=[y0, y1, None],
             line=dict(width=width, color=color),
@@ -49,28 +48,55 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
             showlegend=False
         ))
 
-        # Вычисляем середину для текста
-        if t_load >= 0.1:
-            mid_x.append((x0 + x1) / 2)
-            mid_y.append((y0 + y1) / 2)
-            if selected_load is not None:
-                # Формат: Выбрано / Всего / Капа
-                mid_text.append(f"<b>{s_load:.1f}</b>/{t_load:.1f}/{cap:.0f}")
-            else:
-                mid_text.append(f"{t_load:.1f}/{cap:.0f}")
+        # HOVER-информация
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        mid_x.append(mx)
+        mid_y.append(my)
 
-    # 2. Отрисовка ТЕКСТА на ребрах (постоянно видимый)
-    fig.add_trace(go.Scatter(
-        x=mid_x, y=mid_y,
-        mode='markers+text',
-        text=mid_text,
-        textposition="middle center",
-        textfont=dict(size=9, color="black"),
-        marker=dict(size=0, opacity=0), # Невидимые маркеры, только текст
-        hoverinfo='text',
-        hovertext=[f"Линия: {t}" for t in mid_text],
-        showlegend=False
-    ))
+        if selected_load is not None:
+            mid_text.append(
+                f"Участок: {u} ↔ {v}<br>Заявка: <b>{s_load:.1f} кВт</b><br>Всего: {t_load:.1f} кВт<br>Макс: {cap:.0f} кВт")
+        else:
+            mid_text.append(
+                f"Участок: {u} ↔ {v}<br>Нагрузка: <b>{t_load:.1f} из {cap:.0f} кВт</b><br>Загруженность: {ratio * 100:.1f}%")
+
+        # Вектор направления (по умолчанию по топологии схемы u -> v)
+        start_x, start_y, end_x, end_y = x0, y0, x1, y1
+        if flow_vu > flow_uv:
+            start_x, start_y, end_x, end_y = x1, y1, x0, y0
+
+        dx = end_x - start_x
+        dy = end_y - start_y
+        dist = math.hypot(dx, dy)
+
+        # РИСУЕМ СТРЕЛКУ ВСЕГДА
+        if dist > 0:
+            nx, ny = dx / dist, dy / dist
+            arrow_len = min(0.5, dist * 0.25)
+
+            fig.add_annotation(
+                x=mx + nx * arrow_len, y=my + ny * arrow_len,
+                ax=mx - nx * arrow_len, ay=my - ny * arrow_len,
+                xref='x', yref='y', axref='x', ayref='y',
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.5,
+                arrowwidth=width,
+                arrowcolor=color,
+                opacity=opacity
+            )
+
+    # 2. Отрисовка невидимых точек для HOVER-текста
+    if mid_x:
+        fig.add_trace(go.Scatter(
+            x=mid_x, y=mid_y,
+            mode='markers',
+            marker=dict(size=15, color='rgba(0,0,0,0)'),
+            hoverinfo='text',
+            hovertext=mid_text,
+            hoverlabel=dict(bgcolor="white", font_size=14, font_family="Arial"),
+            showlegend=False
+        ))
 
     # 3. Отрисовка узлов
     node_x, node_y, node_text = [], [], []
@@ -82,16 +108,27 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         node_x.append(x)
         node_y.append(y)
         node_text.append(f"Узел: {node}")
-        
-        if str(node).isalpha(): # Источник
+
+        node_str = str(node)
+
+        # ЛОГИКА РАСПОЗНАВАНИЯ ТИПОВ УЗЛОВ
+        if node_str.islower() and node_str.isalpha():
+            # Строчные буквы (транзитные узлы-точки)
+            node_marker_color.append('gray')
+            node_marker_size.append(8)
+            node_marker_symbol.append('circle')
+        elif node_str.isupper() and node_str.isalpha() and len(node_str) == 1:
+            # Заглавные одиночные буквы (Источники A, B, C...)
             node_marker_color.append('purple')
             node_marker_size.append(18)
             node_marker_symbol.append('square')
-        elif str(node).isdigit(): # Потребитель
+        elif node_str.isdigit():
+            # Только цифры (Потребители 1, 2, 3...)
             node_marker_color.append('dodgerblue')
             node_marker_size.append(12)
             node_marker_symbol.append('circle')
-        else: # Соединение
+        else:
+            # Римские цифры (Крупные узлы связи I., II., III....)
             node_marker_color.append('tomato')
             node_marker_size.append(22)
             node_marker_symbol.append('circle')
@@ -112,56 +149,26 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         showlegend=False
     ))
 
-    # 4. ЛЕГЕНДА (фиктивные трейсы для отображения в легенде)
+    # Обновленная Легенда
     legend_items = [
-        ('Источники (A, B...)', 'purple', 'square', 15),
-        ('Потребители (1, 2...)', 'dodgerblue', 'circle', 10),
-        ('Узлы связи (I., II.)', 'tomato', 'circle', 15),
+        ('Источники', 'purple', 'square', 15),
+        ('Потребители', 'dodgerblue', 'circle', 10),
+        ('Узлы связи', 'tomato', 'circle', 15),
+        ('Транзитные узлы', 'gray', 'circle', 8),
     ]
     for name, color, symbol, size in legend_items:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None],
-            mode='markers',
-            marker=dict(size=size, color=color, symbol=symbol),
-            name=name,
-            showlegend=True
-        ))
-    
-    # Легенда для ребер
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None],
-        mode='lines',
-        line=dict(width=4, color='red'),
-        name='Загруженный участок (>100%)',
-        showlegend=True
-    ))
-    fig.add_trace(go.Scatter(
-        x=[None], y=[None],
-        mode='lines',
-        line=dict(width=6, color='black'),
-        name='Выбранный маршрут',
-        showlegend=True
-    ))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
+                                 marker=dict(size=size, color=color, symbol=symbol), name=name, showlegend=True))
 
     fig.update_layout(
-        title='⚡ Интерактивная карта распределительной сети (Alpha)',
-        title_font_size=24,
-        dragmode='pan',
-        hovermode='closest',
+        title='⚡ Интерактивная карта распределительной сети',
+        title_font_size=24, dragmode='pan', hovermode='closest',
         margin=dict(b=20, l=5, r=5, t=60),
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        template='plotly_white',
-        height=800,
-        legend=dict(
-            yanchor="top",
-            y=0.99,
-            xanchor="left",
-            x=0.01,
-            bgcolor="rgba(255, 255, 255, 0.8)",
-            bordercolor="Black",
-            borderwidth=1
-        )
+        template='plotly_white', height=800,
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255, 255, 255, 0.8)",
+                    bordercolor="Black", borderwidth=1)
     )
 
     return fig
