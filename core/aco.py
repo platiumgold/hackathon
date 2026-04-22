@@ -74,6 +74,7 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
         # Phase 2: Flow allocation with proportional limits
         current_load = {edge: 0.0 for edge in capacities.keys()}
         delivered = {req: 0.0 for req in requests.keys()}
+        request_flows = {req: {} for req in requests.keys()}
         successful_paths = []
 
         # Determine the flow request for each edge
@@ -135,11 +136,13 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                     edge = (p[i], p[i+1])
                     if edge in current_load:
                         current_load[edge] += final_vol
+                        request_flows[po['req']][edge] = request_flows[po['req']].get(edge, 0.0) + final_vol
 
         history.append({
             'load_distribution': current_load.copy(),
             'successful_paths': successful_paths,
-            'delivered': delivered
+            'delivered': delivered,
+            'request_flows': request_flows
         })
 
     return history[-1]

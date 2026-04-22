@@ -235,9 +235,12 @@ class PowerRoutingEnv:
     def get_final_flows(self):
         delivered_dict = {}
         load_distribution = defaultdict(float)
+        request_flows = defaultdict(lambda: defaultdict(float))
+        
         for r in range(self.num_reqs):
             src = self.req_list[r]['src']
             dst = self.req_list[r]['dst']
+            req_key = (src, dst)
             delivered_r = 0.0
             for k in range(self.req_list[r]['actual_k']):
                 flow = self.actual_flows[r, k]
@@ -247,8 +250,14 @@ class PowerRoutingEnv:
                 for i in range(len(path)-1):
                     e = (path[i], path[i+1])
                     load_distribution[e] += flow
-            delivered_dict[(src, dst)] = delivered_dict.get((src, dst), 0.0) + delivered_r
-        return {'load_distribution': dict(load_distribution), 'delivered': delivered_dict}
+                    request_flows[req_key][e] += flow
+            delivered_dict[req_key] = delivered_dict.get(req_key, 0.0) + delivered_r
+            
+        return {
+            'load_distribution': dict(load_distribution), 
+            'delivered': delivered_dict,
+            'request_flows': {req: dict(flows) for req, flows in request_flows.items()}
+        }
 
 
 def get_k_shortest_paths(G, source, target, k=3):
@@ -434,6 +443,7 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
         # Логирование прогресса каждые 10% от общего числа эпох (или на первой эпохе)
         print_interval = max(1, epochs // 10)
         if (epoch + 1) % print_interval == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:4d}/{epochs} | Eval Metric (Fairness): {eval_env.current_metric:.4f} | Eval Delivered: {eval_env.total_delivered:.1f} kW | Best Delivered: {best_delivered_kwt:.1f} kW")
+            avg_ratio = eval_env.total_delivered / eval_env.total_demand
+            print(f"Epoch {epoch+1:4d}/{epochs} | Fairness Metric: {eval_env.current_metric:.4f} | Avg Delivery: {avg_ratio:.2%} | Delivered: {eval_env.total_delivered:.1f} kW")
 
     return best_result if best_result else {'load_distribution': {}, 'delivered': {}}
