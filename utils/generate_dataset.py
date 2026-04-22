@@ -1,5 +1,6 @@
 import random
 import pandas as pd
+import networkx as nx
 from core.data_loader import BASE_TOPOLOGY, TOPOLOGY_POS
 
 def generate_synthetic_network(num_reqs=15, load_level=100.0, bottleneck_level=0.5):
@@ -14,14 +15,27 @@ def generate_synthetic_network(num_reqs=15, load_level=100.0, bottleneck_level=0
     sources = [n for n in all_nodes if str(n).isalpha() and len(str(n)) == 1]
     consumers = [n for n in all_nodes if str(n).isdigit()]
     
-    # 2. Генерируем Таблицу 1.1 (Заявки)
+    # Используем NetworkX для проверки достижимости
+    G = nx.DiGraph()
+    G.add_nodes_from(TOPOLOGY_POS.keys()) # Добавляем все узлы, чтобы избежать NodeNotFound
+    G.add_edges_from(BASE_TOPOLOGY)
+    
     req_data = []
-    for _ in range(num_reqs):
+    attempts = 0
+    max_attempts = num_reqs * 20 # Ограничитель, чтобы не зависнуть, если путей мало
+    
+    while len(req_data) < num_reqs and attempts < max_attempts:
+        attempts += 1
         src = random.choice(sources)
         dst = random.choice(consumers)
-        # Вариация потока +/- 50% от load_level
-        flow = round(load_level * random.uniform(0.5, 1.5), 1)
-        req_data.append([src, dst, flow])
+        
+        # Проверяем, существует ли путь в направленном графе
+        if nx.has_path(G, src, dst):
+            # Вариация потока +/- 50% от load_level
+            flow = round(load_level * random.uniform(0.5, 1.5), 1)
+            # Проверка, чтобы не дублировать ту же пару
+            if not any(r[0] == src and r[1] == dst for r in req_data):
+                req_data.append([src, dst, flow])
     
     df_req = pd.DataFrame(req_data, columns=['Источник потока', 'Потребитель', 'Поток, кВт'])
     
