@@ -22,7 +22,7 @@ def draw_interactive_heatmap(nodes, adj, capacities, final_load):
         x0, y0 = TOPOLOGY_POS[u]
         x1, y1 = TOPOLOGY_POS[v]
         
-        load = final_load.get((u, v), 0.0)
+        load = final_load.get((u, v), 0.0) + final_load.get((v, u), 0.0)
         ratio = min(load / cap, 1.0) if cap > 0 else 0.0
         
         color = 'lightgrey' if load < 0.1 else get_color(ratio)
