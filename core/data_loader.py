@@ -158,15 +158,33 @@ def load_network_data(df_req, df_cap):
     for u, v in BASE_TOPOLOGY:
         final_capacities[(u, v)] = UNLIMITED_CAP
 
+    # Предварительно создаем граф для поиска путей по скрытым узлам
+    G_base = nx.DiGraph(BASE_TOPOLOGY)
+    
     for _, row in df_cap.iterrows():
-        u = normalize_node(row['начало'])
-        v = normalize_node(row['окончание'])
         try:
-            val_str = str(row['Допустимая мощность']).replace(',', '.').replace(' ', '')
-            cap = float(val_str)
-            if u and v:
-                final_capacities[(u, v)] = cap
-                nodes_set.update([u, v])
+            u = normalize_node(row['начало'])
+            v = normalize_node(row['окончание'])
+            cap = float(str(row['Допустимая мощность']).replace(',', '.').replace(' ', ''))
+
+            if not u or not v: continue
+
+            # Если это прямое ребро в топологии - ставим как есть
+            if (u, v) in G_base.edges:
+                final_capacities[(u, v)] = min(final_capacities.get((u, v), float('inf')), cap)
+            else:
+                # Ищем путь между "честными" узлами через скрытые
+                try:
+                    path = nx.shortest_path(G_base, u, v)
+                    for i in range(len(path) - 1):
+                        edge = (path[i], path[i+1])
+                        # Ограничение распространяется на все сегменты пути
+                        final_capacities[edge] = min(final_capacities.get(edge, float('inf')), cap)
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    # Если пути нет в базе, но оно есть в файле - 
+                    # создаем виртуальное ребро (на случай кастомных топологий)
+                    final_capacities[(u, v)] = cap
+                    nodes_set.update([u, v])
         except (ValueError, TypeError):
             continue
 

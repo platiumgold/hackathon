@@ -3,6 +3,10 @@ import pandas as pd
 import networkx as nx
 from core.data_loader import BASE_TOPOLOGY, TOPOLOGY_POS
 
+def is_hidden(node):
+    s = str(node)
+    return s.islower() and s.isalpha()
+
 
 def generate_synthetic_network(num_reqs=15, load_level=100.0, bottleneck_level=0.5):
     """
@@ -42,17 +46,33 @@ def generate_synthetic_network(num_reqs=15, load_level=100.0, bottleneck_level=0
     df_req = pd.DataFrame(req_data, columns=['Источник потока', 'Потребитель', 'Поток, кВт'])
 
     # 3. Генерируем Таблицу 1.2 (Ограничения)
+    # ИСПРАВЛЕНИЕ: генерируем ограничения только на "честные" узлы
+    # Находим все пары честных узлов, которые соединены путем только через скрытые узлы
+    visible_nodes = [n for n in TOPOLOGY_POS.keys() if not is_hidden(n)]
+    logical_edges = []
+    for u in visible_nodes:
+        for v in visible_nodes:
+            if u == v: continue
+            try:
+                path = nx.shortest_path(G, u, v)
+                # Путь считается логическим ребром, если все промежуточные узлы - скрытые
+                if len(path) > 1 and all(is_hidden(node) for node in path[1:-1]):
+                    logical_edges.append((u, v))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
     cap_data = []
     total_flow = df_req['Поток, кВт'].sum() if not df_req.empty else 1000.0
 
-    num_limited_edges = int(len(BASE_TOPOLOGY) * (0.2 + 0.6 * bottleneck_level))
-    limited_edges = random.sample(BASE_TOPOLOGY, num_limited_edges)
-
-    for u, v in limited_edges:
-        min_cap = load_level * 0.5
-        max_cap = total_flow * (1.1 - bottleneck_level)
-        cap = round(random.uniform(min_cap, max_cap), 1)
-        cap_data.append([u, v, cap])
+    # Ограничиваем логические пути
+    num_limited = int(len(logical_edges) * (0.2 + 0.6 * bottleneck_level))
+    if num_limited > 0:
+        selected_logical = random.sample(logical_edges, num_limited)
+        for u, v in selected_logical:
+            min_cap = load_level * 0.5
+            max_cap = total_flow * (1.1 - bottleneck_level)
+            cap = round(random.uniform(min_cap, max_cap), 1)
+            cap_data.append([u, v, cap])
 
     df_cap = pd.DataFrame(cap_data, columns=['начало', 'окончание', 'Допустимая мощность'])
 

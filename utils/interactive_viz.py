@@ -99,25 +99,26 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         ))
 
     # 3. Отрисовка узлов
-    node_x, node_y, node_text = [], [], []
+    node_x, node_y, node_text, node_labels = [], [], [], []
     node_marker_color, node_marker_size, node_marker_symbol = [], [], []
 
     for node in nodes:
         if node not in TOPOLOGY_POS: continue
+        
+        node_str = str(node)
+        
+        # СКРЫВАЕМ ТРАНЗИТНЫЕ УЗЛЫ (строчные латинские буквы)
+        if node_str.islower() and node_str.isalpha():
+            continue
+            
         x, y = TOPOLOGY_POS[node]
         node_x.append(x)
         node_y.append(y)
         node_text.append(f"Узел: {node}")
-
-        node_str = str(node)
+        node_labels.append(node_str)
 
         # ЛОГИКА РАСПОЗНАВАНИЯ ТИПОВ УЗЛОВ
-        if node_str.islower() and node_str.isalpha():
-            # Строчные буквы (транзитные узлы-точки)
-            node_marker_color.append('gray')
-            node_marker_size.append(8)
-            node_marker_symbol.append('circle')
-        elif node_str.isupper() and node_str.isalpha() and len(node_str) == 1:
+        if node_str.isupper() and node_str.isalpha() and len(node_str) == 1:
             # Заглавные одиночные буквы (Источники A, B, C...)
             node_marker_color.append('purple')
             node_marker_size.append(18)
@@ -136,7 +137,7 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
     fig.add_trace(go.Scatter(
         x=node_x, y=node_y,
         mode='markers+text',
-        text=[str(n) for n in nodes if n in TOPOLOGY_POS],
+        text=node_labels,
         textposition="top center",
         textfont=dict(size=10, color="black", family="Arial Black"),
         hoverinfo='text',
@@ -154,7 +155,6 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         ('Источники', 'purple', 'square', 15),
         ('Потребители', 'dodgerblue', 'circle', 10),
         ('Узлы связи', 'tomato', 'circle', 15),
-        ('Транзитные узлы', 'gray', 'circle', 8),
     ]
     for name, color, symbol, size in legend_items:
         fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
