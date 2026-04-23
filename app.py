@@ -12,7 +12,20 @@ from utils.generate_dataset import generate_synthetic_network
 st.set_page_config(page_title="MVP Маршрутизации Энергии", layout="wide")
 
 
-# --- Вспомогательные функции для парсинга PDF ---
+# --- Вспомогательные функции ---
+def reset_results():
+    st.session_state.res = None
+
+def toggle_request(opt_label):
+    """Добавляет или удаляет заявку из глобального выбора"""
+    current = st.session_state.get("req_selector", [])
+    if opt_label in current:
+        current.remove(opt_label)
+    else:
+        current.append(opt_label)
+    st.session_state.req_selector = current
+
+
 def clean_value(val):
     if not val: return 0.0
     try:
@@ -71,6 +84,8 @@ if 'reversed_logical_edges' not in st.session_state:
     st.session_state.reversed_logical_edges = []
 if 'potentially_reversible' not in st.session_state:
     st.session_state.potentially_reversible = [('VI.', 'V.')]
+if 'nodes_info' not in st.session_state:
+    st.session_state.nodes_info = ([], [], {}, {}, {})
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
 st.markdown("**Интеллектуальная система диспетчеризации (ИИ)** на базе гибридных алгоритмов.")
@@ -82,7 +97,6 @@ file_cap = st.sidebar.file_uploader("Загрузить Ограничения (
 
 if file_req and file_cap:
     if st.sidebar.button("📁 Применить загруженные файлы"):
-        # Парсинг Заявок
         if file_req.name.endswith('.pdf'):
             st.session_state.df_req = process_pdf_req(file_req)
         elif file_req.name.endswith('.xlsx'):
@@ -90,14 +104,14 @@ if file_req and file_cap:
         else:
             st.session_state.df_req = pd.read_csv(file_req)
 
-        # Парсинг Ограничений
         if file_cap.name.endswith('.pdf'):
             st.session_state.df_cap = process_pdf_cap(file_cap)
         elif file_cap.name.endswith('.xlsx'):
             st.session_state.df_cap = pd.read_excel(file_cap)
         else:
             st.session_state.df_cap = pd.read_csv(file_cap)
-
+        
+        reset_results()
         st.sidebar.success("Файлы загружены и закреплены!")
 
 st.sidebar.markdown("---")
@@ -110,30 +124,27 @@ with st.sidebar.expander("Настройки генератора"):
         df_r, df_c = generate_synthetic_network(n_req, load_val, bottleneck)
         st.session_state.df_req = df_r
         st.session_state.df_cap = df_c
+        reset_results()
         st.sidebar.success("Сценарий сгенерирован и закреплен!")
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Пульт управления реверсом")
 
-# 1. Список активных кнопок для реверса
 for edge in st.session_state.potentially_reversible:
     u, v = edge
     is_active = edge in st.session_state.reversed_logical_edges
-    
-    # Красивая кнопка-переключатель
     label = f"{'🔄' if is_active else '➡️'} {u} ↔ {v}"
     if st.sidebar.button(label, key=f"btn_rev_{u}_{v}", use_container_width=True):
         if is_active:
             st.session_state.reversed_logical_edges.remove(edge)
         else:
             st.session_state.reversed_logical_edges.append(edge)
+        reset_results()
         st.rerun()
 
-# 2. Добавление новых участков в пульт
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
 all_logical = get_logical_edges()
-# Исключаем те, что уже в пульте
-available_to_add = [f"{u} → {v}" for u, v in all_logical 
+available_to_add = [f"{u} → {v}" for u, v in all_logical
                     if (u, v) not in st.session_state.potentially_reversible]
 
 with st.sidebar.expander("➕ Добавить участок в пульт"):
@@ -142,6 +153,7 @@ with st.sidebar.expander("➕ Добавить участок в пульт"):
         if new_edge_str:
             u_n, v_n = new_edge_str.split(" → ")
             st.session_state.potentially_reversible.append((u_n, v_n))
+            reset_results()
             st.rerun()
 
 algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ",
@@ -154,100 +166,49 @@ current_topo = get_current_topology(st.session_state.reversed_logical_edges)
 nodes, dests, adj, caps, reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap, current_topo)
 st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
 
-# --- Основная область: Редактирование ---
+# --- Основная область: Редактирование и Расчет ---
 if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
     st.subheader("📝 Масштабирование и ручное редактирование данных")
-    st.info(
-        "💡 **Вы можете менять числа, добавлять или удалять строки прямо в таблицах ниже.** Нажмите на ячейку для изменения. Чтобы добавить новую связь, пролистайте вниз таблицы. Все ваши правки будут учтены при нажатии кнопки «Запустить расчет».")
+    st.info("💡 **Вы можете менять числа прямо в таблицах ниже.** Все ваши правки будут учтены при запуске.")
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Таблица 1.1: Заявки (Редактируемо)**")
-        # st.data_editor заменяет st.dataframe и позволяет редактировать данные
-        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True,
-                                    key="editor_req")
+        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True, on_change=reset_results)
     with c2:
         st.markdown("**Таблица 1.2: Доп. мощности (Редактируемо)**")
-        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True,
-                                    key="editor_cap")
+        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True, on_change=reset_results)
 
-    # Перезаписываем данные в сессии на случай, если пользователь их отредактировал
     st.session_state.df_req = edited_req
     st.session_state.df_cap = edited_cap
 
     if run_btn:
-        df_req = st.session_state.df_req
-        df_cap = st.session_state.df_cap
-        
-        # Данные уже загружены в глобальном блоке выше
-        nodes, dests, adj, caps, reqs = st.session_state.nodes_info
-
         res = None
-
         with st.spinner(f'Работает {algo}...'):
             if algo == "Ant Colony (ACO)":
                 res = run_aco(nodes, dests, adj, caps, reqs)
             elif algo == "Physics-Informed GNN":
-                flows, node_idx, req_list = run_gnn(nodes, caps, reqs, epochs=400)
-                idx_to_node = {idx: name for name, idx in node_idx.items()}
-
-                delivered_dict = {}
-                request_flows = {}
-                load_distribution = {}
-
-                total_delivered = 0.0
-                for req_i, ((src, dst), demand) in enumerate(req_list):
-                    req_key = (src, dst)
-                    d_idx = node_idx[dst]
-                    in_d = flows[req_i, :, d_idx].sum().item()
-                    out_d = flows[req_i, d_idx, :].sum().item()
-                    deliv = max(0.0, in_d - out_d)
-                    delivered_dict[req_key] = deliv
-                    total_delivered += deliv
-
-                    request_flows[req_key] = {}
-                    for u in range(num_nodes := len(nodes)):
-                        for v in range(num_nodes):
-                            f_val = flows[req_i, u, v].item()
-                            if f_val > 0.01:
-                                request_flows[req_key][(idx_to_node[u], idx_to_node[v])] = f_val
-
-                total_edges_tensor = flows.sum(dim=0)
-                for u in range(num_nodes):
-                    for v in range(num_nodes):
-                        f_val = total_edges_tensor[u, v].item()
-                        if f_val > 0.1:
-                            load_distribution[(idx_to_node[u], idx_to_node[v])] = f_val
-
-                res = {
-                    'load_distribution': load_distribution,
-                    'delivered': delivered_dict,
-                    'request_flows': request_flows
-                }
-
+                res = run_gnn(nodes, caps, reqs, epochs=250)
             elif algo == "Reinforcement Learning (PPO)":
                 res = run_rl(nodes, dests, adj, caps, reqs)
 
             st.session_state.res = res
             st.session_state.algo_run = algo
-            st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
             st.sidebar.success("Расчет завершен!")
 
-    # --- Отображение результатов ---
     if st.session_state.res is not None:
         nodes, dests, adj, caps, reqs = st.session_state.nodes_info
         res = st.session_state.res
-        final_load = res['load_distribution']
-        total_delivered = sum(res['delivered'].values())
+        final_load = res.get('load_distribution', {})
+        total_delivered = sum(res.get('delivered', {}).values())
         total_requested = sum(reqs.values())
 
         col1, col2 = st.columns(2)
         col1.metric("Запрошено мощности", f"{total_requested:.3f} кВт")
         col2.metric("Фактически доставлено", f"{total_delivered:.3f} кВт")
 
-        st.info(
-            "💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков. Баланс генерации и потребления соблюден.")
+        st.info("💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков.")
 
         st.markdown("---")
         st.subheader("🛠️ Инспектор участков")
@@ -259,7 +220,7 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                 ratio = load / cap if cap > 0 else 0
                 edge_list.append({
                     'edge': (u, v),
-                    'label': f"{u} → {v} (Загрузка: {ratio:.1%}, {load:.1f}/{cap:.0f} кВт)",
+                    'label': f"{u} → {v} (Загрузка: {ratio:.1%}, {load:.3f}/{cap:.0f} кВт)",
                     'ratio': ratio
                 })
 
@@ -271,71 +232,45 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
             selected_edge_label = st.selectbox("Посмотреть, кто нагружает участок:",
                                                options=["-- выберите участок --"] + edge_options)
 
-        # Подготовка словарей для быстрого и точного поиска
         available_reqs = list(res['request_flows'].keys())
         req_to_opt = {}
         opt_to_key = {}
-        
         for r_key in available_reqs:
             s, d = r_key
-            delivered = res['delivered'].get(r_key, 0.0)
-            requested = reqs.get(r_key, 0.0)
-            # Уникальный ключ для multiselect
-            opt_str = f"{s} → {d} ({delivered:.3f}/{requested:.3f} кВт)"
+            deliv = res['delivered'].get(r_key, 0.0)
+            reqv = reqs.get(r_key, 0.0)
+            opt_str = f"{s} → {d} ({deliv:.3f}/{reqv:.3f} кВт)"
             req_to_opt[r_key] = opt_str
             opt_to_key[opt_str] = r_key
 
         req_options = list(opt_to_key.keys())
 
         if selected_edge_label != "-- выберите участок --":
-            # Ищем данные выбранного ребра по точному лейблу
             edge_data = next((e for e in edge_list if e['label'] == selected_edge_label), None)
             if edge_data:
                 target_edge = edge_data['edge']
-
-                # Собираем данные для таблицы детализации
                 breakdown_data = []
                 for r_key, flows in res['request_flows'].items():
                     flow_on_this_edge = flows.get(target_edge, 0.0)
                     if flow_on_this_edge > 0.001:
                         s, d = r_key
-                        breakdown_data.append({
-                            "key": r_key,
-                            "Заявка": f"{s} → {d}",
-                            "flow": flow_on_this_edge
-                        })
+                        breakdown_data.append({"key": r_key, "Заявка": f"{s} → {d}", "flow": flow_on_this_edge})
 
                 if breakdown_data:
                     with col_ins1:
                         with st.expander(f"⚙️ Управление потоками участка: {selected_edge_label}", expanded=True):
-                            st.write("Выберите заявки для отображения их маршрутов на карте:")
-                            
-                            # Получаем текущий список выбранных заявок
+                            st.write("Выберите заявки для отображения маршрутов:")
                             current_selection = st.session_state.get("req_selector", [])
-                            
                             for item in breakdown_data:
                                 r_key = item['key']
                                 flow_val = item['flow']
                                 opt_label = req_to_opt[r_key]
-                                
-                                # Проверяем, выбрана ли уже эта заявка
                                 is_checked = opt_label in current_selection
-                                
-                                # Чекбокс для каждой заявки
                                 cb_label = f"{item['Заявка']} | **Вклад: {flow_val:.3f} кВт**"
-                                if st.checkbox(cb_label, value=is_checked, key=f"cb_{target_edge}_{r_key}"):
-                                    if opt_label not in current_selection:
-                                        current_selection.append(opt_label)
-                                        st.session_state.req_selector = current_selection
-                                        st.rerun()
-                                else:
-                                    if opt_label in current_selection:
-                                        current_selection.remove(opt_label)
-                                        st.session_state.req_selector = current_selection
-                                        st.rerun()
+                                st.checkbox(cb_label, value=is_checked, key=f"cb_{r_key[0]}_{r_key[1]}",
+                                            on_change=toggle_request, args=(opt_label,))
                     
                     with col_ins2:
-                        # Кнопка для быстрой очистки/выделения всех в рамках этого участка
                         if st.button("✨ Подсветить все на этом участке", use_container_width=True):
                             new_sel = list(set(current_selection + [req_to_opt[i['key']] for i in breakdown_data]))
                             st.session_state.req_selector = new_sel
@@ -346,9 +281,8 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                             st.rerun()
 
         st.subheader("🗺️ Визуализация потоков")
-        selected_opts = st.multiselect("🔍 Выберите конкретные заявки для подсветки маршрутов (пусто = общая нагрузка):",
-                                       options=req_options,
-                                       key="req_selector")
+        selected_opts = st.multiselect("🔍 Выберите заявки (пусто = общая нагрузка):",
+                                       options=req_options, key="req_selector")
 
         selected_load = None
         current_selection = st.session_state.get("req_selector", [])
@@ -365,49 +299,32 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
         st.markdown("---")
-        st.subheader("📊 Анализ справедливости и статуса заявок")
-
+        st.subheader("📊 Анализ справедливости")
         req_stats = []
         for (src, dst), req_val in reqs.items():
             deliv_val = res['delivered'].get((src, dst), 0.0)
             ratio = deliv_val / req_val if req_val > 0 else 1.0
-            req_stats.append({
-                "Источник": src,
-                "Потребитель": dst,
-                "Заявлено (кВт)": f"{req_val:.3f}",
-                "Доставлено (кВт)": f"{deliv_val:.3f}",
-                "Выполнение (%)": f"{ratio * 100:.1f}%",
-                "ratio_num": ratio
-            })
-
+            req_stats.append({"Источник": src, "Потребитель": dst, "Заявлено (кВт)": f"{req_val:.3f}",
+                              "Доставлено (кВт)": f"{deliv_val:.3f}", "Выполнение (%)": f"{ratio * 100:.1f}%",
+                              "ratio_num": ratio})
         df_stats = pd.DataFrame(req_stats)
-
         col_t1, col_t2 = st.columns([2, 1])
         with col_t1:
-            st.markdown("**Статус выполнения каждой заявки**")
             st.dataframe(df_stats.drop(columns=["ratio_num"]), use_container_width=True, height=400)
         with col_t2:
-            st.markdown("**Распределение справедливости**")
-            fig_hist = px.histogram(df_stats, x="ratio_num", nbins=10,
-                                    labels={'ratio_num': 'Доля выполнения'},
-                                    title="Гистограмма удовлетворенности",
-                                    color_discrete_sequence=['#FF4B4B'])
-            fig_hist.update_layout(showlegend=False, height=400)
+            fig_hist = px.histogram(df_stats, x="ratio_num", nbins=10, labels={'ratio_num': 'Доля выполнения'},
+                                    title="Гистограмма удовлетворенности", color_discrete_sequence=['#FF4B4B'])
             st.plotly_chart(fig_hist, use_container_width=True)
 
-        st.success(
-            f"✅ Расчет завершен. Средний уровень выполнения заявок: {total_delivered / (total_requested + 1e-9):.1%}")
-
-    # --- ВСЕГДА ПОКАЗЫВАЕМ КАРТУ (даже если расчет не запущен) ---
     if st.session_state.res is None:
-        st.subheader("🗺️ Визуализация топологии")
-        st.info("Это текущая структура сети. Вы можете разворачивать участки в боковом меню. Для расчета потоков нажмите «Запустить расчет».")
+        st.subheader("🗺️ Базовая топология сети")
+        st.info("Для расчета потоков нажмите «Запустить расчет».")
         fig = draw_interactive_heatmap(nodes, adj, caps, {})
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+
 else:
-    # Если данных нет, все равно показываем пустую топологию
     st.subheader("🗺️ Базовая топология сети «Альфа»")
     nodes, dests, adj, caps, reqs = st.session_state.nodes_info
     fig = draw_interactive_heatmap(nodes, adj, caps, {})
     st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
-    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню для анализа нагрузок.")
+    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню.")

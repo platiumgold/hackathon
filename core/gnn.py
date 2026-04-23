@@ -1,38 +1,33 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import networkx as nx
+from collections import defaultdict
+import numpy as np
 
 
 class StrictEnergyGNN(nn.Module):
-    def __init__(self, num_nodes, embed_dim=16):
+    def __init__(self, num_nodes, embed_dim=32):
         super().__init__()
         self.num_nodes = num_nodes
-        # Эмбеддинги помогают сети понимать "соседство" узлов
         self.node_embed = nn.Embedding(num_nodes, embed_dim)
 
-        # Оценка ребер (кто я -> куда иду -> конечная цель)
         self.edge_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 3, 32),
+            nn.Linear(embed_dim * 3, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 1)
         )
 
-        # Оценка поглощения (нужно ли оставить энергию здесь)
-        self.sink_mlp = nn.Sequential(
-            nn.Linear(embed_dim * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
-    def get_routing_matrices(self, adj_mask, dst_idx):
-        """Возвращает вероятности перехода для конкретного узла назначения"""
+    def get_edge_probabilities(self, adj_mask, dst_idx):
+        """Считает вероятности перехода по ребрам на основе графовых признаков"""
         emb = self.node_embed.weight
         dst_emb = emb[dst_idx].expand(self.num_nodes, -1)
 
-        # Считаем логиты для ребер
-        edge_logits = torch.full((self.num_nodes, self.num_nodes), -1e9)
+        edge_logits = torch.full((self.num_nodes, self.num_nodes), -1e9, device=emb.device)
         for i in range(self.num_nodes):
-            # Векторизуем соседей для i
             neighbors = torch.where(adj_mask[i] > 0)[0]
             if len(neighbors) > 0:
                 e_in = torch.cat([
@@ -42,24 +37,26 @@ class StrictEnergyGNN(nn.Module):
                 ], dim=1)
                 edge_logits[i, neighbors] = self.edge_mlp(e_in).squeeze(-1)
 
-        # Логиты поглощения
-        sink_input = torch.cat([emb, dst_emb], dim=1)
-        sink_logits = self.sink_mlp(sink_input).squeeze(-1)
-
-        # Softmax гарантирует, что сумма (выходные ребра + поглощение) = 1.0
-        combined = torch.cat([edge_logits, sink_logits.unsqueeze(1)], dim=1)
-        probs = torch.softmax(combined, dim=1)
-
-        return probs[:, :self.num_nodes], probs[:, self.num_nodes]
+        # Нормализуем вероятности для каждого узла
+        probs = torch.softmax(edge_logits, dim=1)
+        # Убираем вероятности там, где нет физических связей
+        probs = probs * adj_mask
+        return probs
 
 
-def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.01):
+def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.005):
     num_nodes = len(nodes)
     node_idx = {name: i for i, name in enumerate(nodes)}
-    req_list = list(requests.items())
-    num_reqs = len(req_list)
+    reverse_node_idx = {i: name for i, name in enumerate(nodes)}
 
-    # Подготовка масок
+    req_list = []
+    for (src, dst), amount in requests.items():
+        if src in node_idx and dst in node_idx:
+            req_list.append(((src, dst), amount))
+
+    if not req_list:
+        return {'load_distribution': {}, 'delivered': {}, 'request_flows': {}}
+
     adj_mask = torch.zeros((num_nodes, num_nodes))
     cap_matrix = torch.zeros((num_nodes, num_nodes))
     for (u, v), cap in final_capacities.items():
@@ -67,64 +64,104 @@ def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.01):
             adj_mask[node_idx[u], node_idx[v]] = 1.0
             cap_matrix[node_idx[u], node_idx[v]] = float(cap)
 
-    model = StrictEnergyGNN(num_nodes)
+    model = StrictEnergyGNN(num_nodes, embed_dim=32)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    # Глубина графа для симуляции (сколько шагов может пройти ток)
-    max_steps = min(num_nodes, 10)
-
+    # --- ЭТАП 1: Обучение GNN для понимания структуры графа ---
+    model.train()
     for epoch in range(epochs):
         optimizer.zero_grad()
-        total_loss = 0
-        all_req_flows = []
+        total_loss = 0.0
 
         for r_idx, ((src, dst), demand) in enumerate(req_list):
             s_i, d_i = node_idx[src], node_idx[dst]
-            P_edge, P_sink = model.get_routing_matrices(adj_mask, d_i)
+            probs = model.get_edge_probabilities(adj_mask, d_i)
 
-            current_dist = torch.zeros(num_nodes)
-            current_dist[s_i] = float(demand)
+            # Штраф: направлять потоки в сторону цели
+            # Используем простую эвристику расстояний
+            path_loss = -torch.log(probs[s_i, :].clamp(min=1e-5)).mean()
+            total_loss += path_loss
 
-            req_flow_matrix = torch.zeros((num_nodes, num_nodes))
-            delivered = 0
+        if total_loss > 0:
+            total_loss.backward()
+            optimizer.step()
 
-            for _ in range(max_steps):
-                step_flows = current_dist.unsqueeze(1) * P_edge
-                req_flow_matrix += step_flows
+    # --- ЭТАП 2: Применение бизнес-логики (Evaluation & Routing) ---
+    model.eval()
 
-                absorbed = current_dist * P_sink
-                delivered += absorbed[d_i]
+    delivered_dict = {(src, dst): 0.0 for (src, dst), _ in req_list}
+    load_distribution = defaultdict(float)
+    request_flows_dict = defaultdict(lambda: defaultdict(float))
 
-                # Штраф за потерю энергии (поглощение не в целевом узле)
-                loss_waste = (absorbed.sum() - absorbed[d_i]) * 15.0
-                total_loss += loss_waste
+    # Текущие свободные мощности в сети (динамически обновляются)
+    current_capacities = {k: v for k, v in final_capacities.items()}
 
-                current_dist = step_flows.sum(dim=0)
+    # Чтобы соблюсти условие пропорциональности, бьем объемы на итерации (например 50 шагов)
+    # На каждом шаге каждая заявка пытается передать 2% от своего изначального объема
+    num_steps = 50
+    step_demands = {req_key: amount / num_steps for req_key, amount in req_list}
 
-            # Штраф за недоставку
-            total_loss += (float(demand) - delivered) * 20.0
-            all_req_flows.append(req_flow_matrix)
-
-        # Штраф за перегрузку ЛЭП
-        total_flows = torch.stack(all_req_flows).sum(dim=0)
-        overflow = torch.relu(total_flows - cap_matrix)
-        total_loss += overflow.sum() * 10.0
-
-        total_loss.backward()
-        optimizer.step()
-
-    # Финальный расчет результатов
     with torch.no_grad():
-        final_results = torch.zeros((num_reqs, num_nodes, num_nodes))
-        for r_idx, ((src, dst), demand) in enumerate(req_list):
-            s_i, d_i = node_idx[src], node_idx[dst]
-            P_edge, P_sink = model.get_routing_matrices(adj_mask, d_i)
+        # Предрассчитаем веса ребер (штрафы) для каждой заявки на основе GNN
+        gnn_weights = {}
+        for (src, dst), _ in req_list:
+            d_i = node_idx[dst]
+            probs = model.get_edge_probabilities(adj_mask, d_i).numpy()
+            # Чем выше вероятность GNN, тем ниже вес (сопротивление) ребра
+            weight_matrix = -np.log(probs + 1e-9)
+            gnn_weights[(src, dst)] = weight_matrix
 
-            curr = torch.zeros(num_nodes)
-            curr[s_i] = float(demand)
-            for _ in range(max_steps):
-                step_f = curr.unsqueeze(1) * P_edge
-                final_results[r_idx] += step_f
-                curr = step_f.sum(dim=0)
+    for step in range(num_steps):
+        for (src, dst), amount in req_list:
+            req_key = (src, dst)
+            amount_to_send = step_demands[req_key]
 
-    return final_results, node_idx, req_list
+            if amount_to_send <= 0:
+                continue
+
+            # Ищем пути, пока не передадим порцию энергии или пока не закончатся пути
+            while amount_to_send > 1e-4:
+                # 1. Строим граф только из доступных ребер
+                G = nx.DiGraph()
+                for (u, v), cap in current_capacities.items():
+                    if cap > 1e-4:  # Ребро доступно
+                        u_idx, v_idx = node_idx[u], node_idx[v]
+                        # Вес ребра из GNN
+                        w = gnn_weights[req_key][u_idx, v_idx]
+                        G.add_edge(u, v, weight=w)
+
+                # 2. Ищем путь
+                try:
+                    # GNN направляет поиск кратчайшего пути
+                    path = nx.shortest_path(G, source=src, target=dst, weight='weight')
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    # Если путей больше нет, значит лимит по всем направлениям исчерпан
+                    # Оставшаяся энергия просто не доставляется (срабатывает пропорциональное ограничение)
+                    break
+
+                    # 3. Находим "узкое горлышко" на найденном пути
+                path_edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+                bottleneck_cap = min(current_capacities[e] for e in path_edges)
+
+                # Сколько энергии реально можем протолкнуть по этому пути прямо сейчас
+                flow_to_push = min(amount_to_send, bottleneck_cap)
+
+                # 4. Проталкиваем энергию и обновляем состояние
+                delivered_dict[req_key] += flow_to_push
+                amount_to_send -= flow_to_push
+
+                for e in path_edges:
+                    current_capacities[e] -= flow_to_push
+                    load_distribution[e] += flow_to_push
+                    request_flows_dict[req_key][e] += flow_to_push
+
+    # Очистка от пустых значений для красоты словаря
+    clean_request_flows = {
+        req: dict(flows) for req, flows in request_flows_dict.items() if flows
+    }
+
+    return {
+        'load_distribution': dict(load_distribution),
+        'delivered': delivered_dict,
+        'request_flows': clean_request_flows
+    }
