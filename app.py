@@ -71,6 +71,8 @@ if 'reversed_logical_edges' not in st.session_state:
     st.session_state.reversed_logical_edges = []
 if 'potentially_reversible' not in st.session_state:
     st.session_state.potentially_reversible = [('VI.', 'V.')]
+if 'nodes_info' not in st.session_state:
+    st.session_state.nodes_info = ([], [], {}, {}, {})
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
 st.markdown("**Интеллектуальная система диспетчеризации (ИИ)** на базе гибридных алгоритмов.")
@@ -82,7 +84,6 @@ file_cap = st.sidebar.file_uploader("Загрузить Ограничения (
 
 if file_req and file_cap:
     if st.sidebar.button("📁 Применить загруженные файлы"):
-        # Парсинг Заявок
         if file_req.name.endswith('.pdf'):
             st.session_state.df_req = process_pdf_req(file_req)
         elif file_req.name.endswith('.xlsx'):
@@ -90,14 +91,12 @@ if file_req and file_cap:
         else:
             st.session_state.df_req = pd.read_csv(file_req)
 
-        # Парсинг Ограничений
         if file_cap.name.endswith('.pdf'):
             st.session_state.df_cap = process_pdf_cap(file_cap)
         elif file_cap.name.endswith('.xlsx'):
             st.session_state.df_cap = pd.read_excel(file_cap)
         else:
             st.session_state.df_cap = pd.read_csv(file_cap)
-
         st.sidebar.success("Файлы загружены и закреплены!")
 
 st.sidebar.markdown("---")
@@ -115,12 +114,10 @@ with st.sidebar.expander("Настройки генератора"):
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Пульт управления реверсом")
 
-# 1. Список активных кнопок для реверса
 for edge in st.session_state.potentially_reversible:
     u, v = edge
     is_active = edge in st.session_state.reversed_logical_edges
-    
-    # Красивая кнопка-переключатель
+
     label = f"{'🔄' if is_active else '➡️'} {u} ↔ {v}"
     if st.sidebar.button(label, key=f"btn_rev_{u}_{v}", use_container_width=True):
         if is_active:
@@ -129,11 +126,9 @@ for edge in st.session_state.potentially_reversible:
             st.session_state.reversed_logical_edges.append(edge)
         st.rerun()
 
-# 2. Добавление новых участков в пульт
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
 all_logical = get_logical_edges()
-# Исключаем те, что уже в пульте
-available_to_add = [f"{u} → {v}" for u, v in all_logical 
+available_to_add = [f"{u} → {v}" for u, v in all_logical
                     if (u, v) not in st.session_state.potentially_reversible]
 
 with st.sidebar.expander("➕ Добавить участок в пульт"):
@@ -151,51 +146,41 @@ run_btn = st.sidebar.button("🚀 ЗАПУСТИТЬ РАСЧЕТ", type="primar
 
 # --- ГЛОБАЛЬНАЯ ПОДГОТОВКА ТОПОЛОГИИ ---
 current_topo = get_current_topology(st.session_state.reversed_logical_edges)
-nodes, dests, adj, caps, reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap, current_topo)
-st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
 
-# --- Основная область: Редактирование ---
+# --- Основная область: Редактирование и Расчет ---
 if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
     st.subheader("📝 Масштабирование и ручное редактирование данных")
-    st.info(
-        "💡 **Вы можете менять числа, добавлять или удалять строки прямо в таблицах ниже.** Нажмите на ячейку для изменения. Чтобы добавить новую связь, пролистайте вниз таблицы. Все ваши правки будут учтены при нажатии кнопки «Запустить расчет».")
+    st.info("💡 **Вы можете менять числа прямо в таблицах ниже.** Все ваши правки будут учтены при запуске.")
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Таблица 1.1: Заявки (Редактируемо)**")
-        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True,
-                                    key="editor_req")
+        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True)
     with c2:
         st.markdown("**Таблица 1.2: Доп. мощности (Редактируемо)**")
-        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True,
-                                    key="editor_cap")
+        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True)
 
-    # Перезаписываем данные в сессии на случай, если пользователь их отредактировал
+    # Записываем изменения пользователя обратно в сессию
     st.session_state.df_req = edited_req
     st.session_state.df_cap = edited_cap
 
+    # ВАЖНО: Парсим граф ТОЛЬКО ПОСЛЕ работы редактора, чтобы учесть ручные изменения
+    nodes, dests, adj, caps, reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap, current_topo)
+    st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
+
     if run_btn:
-        df_req = st.session_state.df_req
-        df_cap = st.session_state.df_cap
-        
-        # Данные уже загружены в глобальном блоке выше
-        nodes, dests, adj, caps, reqs = st.session_state.nodes_info
-
         res = None
-
         with st.spinner(f'Работает {algo}...'):
             if algo == "Ant Colony (ACO)":
                 res = run_aco(nodes, dests, adj, caps, reqs)
             elif algo == "Physics-Informed GNN":
-                # ИСПРАВЛЕНО: Передаем caps и reqs. GNN уже возвращает нужный словарь.
                 res = run_gnn(nodes, caps, reqs, epochs=250)
             elif algo == "Reinforcement Learning (PPO)":
                 res = run_rl(nodes, dests, adj, caps, reqs)
 
             st.session_state.res = res
             st.session_state.algo_run = algo
-            st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
             st.sidebar.success("Расчет завершен!")
 
     # --- Отображение результатов ---
@@ -307,19 +292,24 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
             fig_hist.update_layout(showlegend=False, height=400)
             st.plotly_chart(fig_hist, use_container_width=True)
 
-        st.success(
-            f"✅ Расчет завершен. Средний уровень выполнения заявок: {total_delivered / (total_requested + 1e-9):.1%}")
-
-    # --- ВСЕГДА ПОКАЗЫВАЕМ КАРТУ (даже если расчет не запущен) ---
     if st.session_state.res is None:
-        st.subheader("🗺️ Визуализация топологии")
-        st.info("Это текущая структура сети. Вы можете разворачивать участки в боковом меню. Для расчета потоков нажмите «Запустить расчет».")
+        st.subheader("🗺️ Базовая топология сети")
+        st.info("Это текущая структура сети. Для расчета потоков нажмите «Запустить расчет».")
         fig = draw_interactive_heatmap(nodes, adj, caps, {})
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+
 else:
-    # Если данных нет, все равно показываем пустую топологию
     st.subheader("🗺️ Базовая топология сети «Альфа»")
-    nodes, dests, adj, caps, reqs = st.session_state.nodes_info
-    fig = draw_interactive_heatmap(nodes, adj, caps, {})
-    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
-    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню для анализа нагрузок.")
+
+    # Генерация пустой карты для красоты при первом запуске (чтобы не было белого экрана)
+    empty_df_req = pd.DataFrame(columns=["Источник потока", "Потребитель", "Поток, кВт"])
+    empty_df_cap = pd.DataFrame(columns=["начало", "окончание", "Допустимая мощность"])
+    try:
+        nodes, dests, adj, caps, reqs = load_network_data(empty_df_req, empty_df_cap, current_topo)
+        st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
+        fig = draw_interactive_heatmap(nodes, adj, caps, {})
+        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+    except Exception:
+        pass
+
+    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню для начала работы.")
