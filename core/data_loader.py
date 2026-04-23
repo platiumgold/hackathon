@@ -127,66 +127,128 @@ TOPOLOGY_POS = {
 }
 
 
+def is_hidden(node):
+    s = str(node)
+    return s.islower() and s.isalpha()
+
+
+def get_logical_edges():
+    """Возвращает список всех 'честных' ребер (путей между видимыми узлами через скрытые)"""
+    visible_nodes = [n for n in TOPOLOGY_POS.keys() if not is_hidden(n)]
+    G = nx.DiGraph(BASE_TOPOLOGY)
+    
+    logical_edges = []
+    for u in visible_nodes:
+        for v in visible_nodes:
+            if u == v: continue
+            try:
+                path = nx.shortest_path(G, u, v)
+                if len(path) > 1 and all(is_hidden(node) for node in path[1:-1]):
+                    logical_edges.append((u, v))
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+    return sorted(logical_edges)
+
+
+def get_current_topology(reversed_logical_edges):
+    """
+    Создает модифицированную топологию, разворачивая указанные логические ребра
+    вместе со всеми их скрытыми сегментами.
+    """
+    G = nx.DiGraph(BASE_TOPOLOGY)
+    edges_to_remove = set()
+    edges_to_add = set()
+    
+    for u, v in reversed_logical_edges:
+        try:
+            path = nx.shortest_path(G, u, v)
+            for i in range(len(path) - 1):
+                seg = (path[i], path[i+1])
+                edges_to_remove.add(seg)
+                edges_to_add.add((path[i+1], path[i]))
+        except:
+            continue
+            
+    new_edges = []
+    for e in BASE_TOPOLOGY:
+        if e in edges_to_remove:
+            continue
+        new_edges.append(e)
+    
+    for e in edges_to_add:
+        new_edges.append(e)
+        
+    return new_edges
+
+
 def normalize_node(val):
     if val is None: return ""
     return str(val).strip()
 
 
-def load_network_data(df_req, df_cap):
+def load_network_data(df_req=None, df_cap=None, topology_override=None):
     requests = {}
     nodes_set = set()
+    
+    active_topology = topology_override if topology_override is not None else BASE_TOPOLOGY
 
-    for u, v in BASE_TOPOLOGY:
+    for u, v in active_topology:
         nodes_set.update([u, v])
 
     total_requested = 0
-    for _, row in df_req.iterrows():
-        src = normalize_node(row['Источник потока'])
-        dst = normalize_node(row['Потребитель'])
-        try:
-            val_str = str(row['Поток, кВт']).replace(',', '.').replace(' ', '')
-            vol = float(val_str)
-            if src and dst:
-                requests[(src, dst)] = vol
-                nodes_set.update([src, dst])
-                total_requested += vol
-        except (ValueError, TypeError):
-            continue
+    if df_req is not None:
+        for _, row in df_req.iterrows():
+            src = normalize_node(row.get('Источник потока'))
+            dst = normalize_node(row.get('Потребитель'))
+            try:
+                val_str = str(row.get('Поток, кВт', 0)).replace(',', '.').replace(' ', '')
+                vol = float(val_str)
+                if src and dst:
+                    requests[(src, dst)] = vol
+                    nodes_set.update([src, dst])
+                    total_requested += vol
+            except (ValueError, TypeError):
+                continue
 
     UNLIMITED_CAP = total_requested + 10000.0
     final_capacities = {}
-    for u, v in BASE_TOPOLOGY:
+    for u, v in active_topology:
         final_capacities[(u, v)] = UNLIMITED_CAP
 
     # Предварительно создаем граф для поиска путей по скрытым узлам
-    G_base = nx.DiGraph(BASE_TOPOLOGY)
+    G_base = nx.DiGraph(active_topology)
     
-    for _, row in df_cap.iterrows():
-        try:
-            u = normalize_node(row['начало'])
-            v = normalize_node(row['окончание'])
-            cap = float(str(row['Допустимая мощность']).replace(',', '.').replace(' ', ''))
+    # Создаем ненаправленный граф для поиска "физического" пути между узлами,
+    # даже если в текущей топологии ребра развернуты.
+    G_undirected = nx.Graph(BASE_TOPOLOGY)
+    
+    if df_cap is not None:
+        for _, row in df_cap.iterrows():
+            try:
+                u = normalize_node(row.get('начало'))
+                v = normalize_node(row.get('окончание'))
+                cap_val = row.get('Допустимая мощность', UNLIMITED_CAP)
+                cap = float(str(cap_val).replace(',', '.').replace(' ', ''))
 
-            if not u or not v: continue
+                if not u or not v: continue
 
-            # Если это прямое ребро в топологии - ставим как есть
-            if (u, v) in G_base.edges:
-                final_capacities[(u, v)] = min(final_capacities.get((u, v), float('inf')), cap)
-            else:
-                # Ищем путь между "честными" узлами через скрытые
+                # Ищем "физический" путь в базовой топологии
                 try:
-                    path = nx.shortest_path(G_base, u, v)
+                    # Ищем путь в ненаправленном графе, чтобы найти все сегменты "трубы"
+                    path = nx.shortest_path(G_undirected, u, v)
                     for i in range(len(path) - 1):
-                        edge = (path[i], path[i+1])
-                        # Ограничение распространяется на все сегменты пути
-                        final_capacities[edge] = min(final_capacities.get(edge, float('inf')), cap)
+                        n1, n2 = path[i], path[i+1]
+                        # Проверяем, какое направление этого сегмента сейчас активно в топологии
+                        if (n1, n2) in final_capacities:
+                            final_capacities[(n1, n2)] = min(final_capacities[(n1, n2)], cap)
+                        if (n2, n1) in final_capacities:
+                            final_capacities[(n2, n1)] = min(final_capacities[(n2, n1)], cap)
                 except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    # Если пути нет в базе, но оно есть в файле - 
-                    # создаем виртуальное ребро (на случай кастомных топологий)
-                    final_capacities[(u, v)] = cap
-                    nodes_set.update([u, v])
-        except (ValueError, TypeError):
-            continue
+                    # Если это вообще левое ребро, не из топологии - игнорируем или
+                    # (если очень надо) можно добавить как виртуальное, но лучше не стоит
+                    pass
+            except (ValueError, TypeError):
+                continue
 
     nodes = list(nodes_set)
     destinations = list(set(dst for src, dst in requests.keys()))

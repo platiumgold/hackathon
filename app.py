@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import pdfplumber
-from core.data_loader import load_network_data
+from core.data_loader import load_network_data, get_logical_edges, get_current_topology
 from core.aco import run_aco
 from core.gnn import run_gnn
 from core.rl import run_rl
@@ -67,6 +67,8 @@ if 'res' not in st.session_state:
     st.session_state.res = None
 if 'algo_run' not in st.session_state:
     st.session_state.algo_run = ""
+if 'reversed_logical_edges' not in st.session_state:
+    st.session_state.reversed_logical_edges = []
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
 st.markdown("**Интеллектуальная система диспетчеризации (ИИ)** на базе гибридных алгоритмов.")
@@ -108,10 +110,31 @@ with st.sidebar.expander("Настройки генератора"):
         st.session_state.df_cap = df_c
         st.sidebar.success("Сценарий сгенерирован и закреплен!")
 
-st.sidebar.markdown("---")
 algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ",
                         ["Physics-Informed GNN", "Ant Colony (ACO)", "Reinforcement Learning (PPO)"])
+
+st.sidebar.markdown("---")
+st.sidebar.header("🔄 Реверс направлений")
+all_logical = get_logical_edges()
+logical_options = [f"{u} → {v}" for u, v in all_logical]
+selected_rev_strs = st.sidebar.multiselect(
+    "Развернуть поток на участках:",
+    options=logical_options,
+    default=[f"{u} → {v}" for u, v in st.session_state.reversed_logical_edges],
+    help="Выберите логические участки (между реальными узлами), которые нужно развернуть. Все скрытые сегменты внутри участка развернутся автоматически."
+)
+# Синхронизируем состояние
+st.session_state.reversed_logical_edges = []
+for s in selected_rev_strs:
+    parts = s.split(" → ")
+    st.session_state.reversed_logical_edges.append((parts[0], parts[1]))
+
 run_btn = st.sidebar.button("🚀 ЗАПУСТИТЬ РАСЧЕТ")
+
+# --- ГЛОБАЛЬНАЯ ПОДГОТОВКА ТОПОЛОГИИ ---
+current_topo = get_current_topology(st.session_state.reversed_logical_edges)
+nodes, dests, adj, caps, reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap, current_topo)
+st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
 
 # --- Основная область: Редактирование ---
 if st.session_state.df_req is not None and st.session_state.df_cap is not None:
@@ -138,9 +161,9 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
     if run_btn:
         df_req = st.session_state.df_req
         df_cap = st.session_state.df_cap
-
-        with st.spinner('Анализ топологии...'):
-            nodes, dests, adj, caps, reqs = load_network_data(df_req, df_cap)
+        
+        # Данные уже загружены в глобальном блоке выше
+        nodes, dests, adj, caps, reqs = st.session_state.nodes_info
 
         res = None
 
@@ -304,5 +327,17 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
         st.success(
             f"✅ Расчет завершен. Средний уровень выполнения заявок: {total_delivered / (total_requested + 1e-9):.1%}")
+
+    # --- ВСЕГДА ПОКАЗЫВАЕМ КАРТУ (даже если расчет не запущен) ---
+    if st.session_state.res is None:
+        st.subheader("🗺️ Визуализация топологии")
+        st.info("Это текущая структура сети. Вы можете разворачивать участки в боковом меню. Для расчета потоков нажмите «Запустить расчет».")
+        fig = draw_interactive_heatmap(nodes, adj, caps, {})
+        st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 else:
-    st.info("👋 Добро пожаловать! Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню.")
+    # Если данных нет, все равно показываем пустую топологию
+    st.subheader("🗺️ Базовая топология сети «Альфа»")
+    nodes, dests, adj, caps, reqs = st.session_state.nodes_info
+    fig = draw_interactive_heatmap(nodes, adj, caps, {})
+    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню для анализа нагрузок.")
