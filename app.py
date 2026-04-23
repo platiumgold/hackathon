@@ -271,28 +271,79 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
             selected_edge_label = st.selectbox("Посмотреть, кто нагружает участок:",
                                                options=["-- выберите участок --"] + edge_options)
 
+        # Подготовка словарей для быстрого и точного поиска
         available_reqs = list(res['request_flows'].keys())
-        req_options = [f"{s} → {d} ({res['delivered'].get((s, d), 0):.1f}/{reqs.get((s, d), 0):.1f} кВт)"
-                       for s, d in available_reqs]
-        req_to_key = {opt: key for opt, key in zip(req_options, available_reqs)}
+        req_to_opt = {}
+        opt_to_key = {}
+        
+        for r_key in available_reqs:
+            s, d = r_key
+            delivered = res['delivered'].get(r_key, 0.0)
+            requested = reqs.get(r_key, 0.0)
+            # Уникальный ключ для multiselect
+            opt_str = f"{s} → {d} ({delivered:.3f}/{requested:.3f} кВт)"
+            req_to_opt[r_key] = opt_str
+            opt_to_key[opt_str] = r_key
+
+        req_options = list(opt_to_key.keys())
 
         if selected_edge_label != "-- выберите участок --":
-            edge_data = next(e for e in edge_list if e['label'] == selected_edge_label)
-            target_edge = edge_data['edge']
+            # Ищем данные выбранного ребра по точному лейблу
+            edge_data = next((e for e in edge_list if e['label'] == selected_edge_label), None)
+            if edge_data:
+                target_edge = edge_data['edge']
 
-            reqs_on_edge = []
-            for req_key, flows in res['request_flows'].items():
-                if target_edge in flows:
-                    opt = next((o for o in req_options if o.startswith(f"{req_key[0]} → {req_key[1]}")), None)
-                    if opt:
-                        reqs_on_edge.append(opt)
+                # Собираем данные для таблицы детализации
+                breakdown_data = []
+                for r_key, flows in res['request_flows'].items():
+                    flow_on_this_edge = flows.get(target_edge, 0.0)
+                    if flow_on_this_edge > 0.001:
+                        s, d = r_key
+                        breakdown_data.append({
+                            "key": r_key,
+                            "Заявка": f"{s} → {d}",
+                            "flow": flow_on_this_edge
+                        })
 
-            if reqs_on_edge:
-                with col_ins2:
-                    st.write("")
-                    if st.button(f"✨ Показать все ({len(reqs_on_edge)})"):
-                        st.session_state.req_selector = reqs_on_edge
-                        st.rerun()
+                if breakdown_data:
+                    with col_ins1:
+                        with st.expander(f"⚙️ Управление потоками участка: {selected_edge_label}", expanded=True):
+                            st.write("Выберите заявки для отображения их маршрутов на карте:")
+                            
+                            # Получаем текущий список выбранных заявок
+                            current_selection = st.session_state.get("req_selector", [])
+                            
+                            for item in breakdown_data:
+                                r_key = item['key']
+                                flow_val = item['flow']
+                                opt_label = req_to_opt[r_key]
+                                
+                                # Проверяем, выбрана ли уже эта заявка
+                                is_checked = opt_label in current_selection
+                                
+                                # Чекбокс для каждой заявки
+                                cb_label = f"{item['Заявка']} | **Вклад: {flow_val:.3f} кВт**"
+                                if st.checkbox(cb_label, value=is_checked, key=f"cb_{target_edge}_{r_key}"):
+                                    if opt_label not in current_selection:
+                                        current_selection.append(opt_label)
+                                        st.session_state.req_selector = current_selection
+                                        st.rerun()
+                                else:
+                                    if opt_label in current_selection:
+                                        current_selection.remove(opt_label)
+                                        st.session_state.req_selector = current_selection
+                                        st.rerun()
+                    
+                    with col_ins2:
+                        # Кнопка для быстрой очистки/выделения всех в рамках этого участка
+                        if st.button("✨ Подсветить все на этом участке", use_container_width=True):
+                            new_sel = list(set(current_selection + [req_to_opt[i['key']] for i in breakdown_data]))
+                            st.session_state.req_selector = new_sel
+                            st.rerun()
+                        if st.button("🧹 Скрыть все на этом участке", use_container_width=True):
+                            new_sel = [s for s in current_selection if s not in [req_to_opt[i['key']] for i in breakdown_data]]
+                            st.session_state.req_selector = new_sel
+                            st.rerun()
 
         st.subheader("🗺️ Визуализация потоков")
         selected_opts = st.multiselect("🔍 Выберите конкретные заявки для подсветки маршрутов (пусто = общая нагрузка):",
@@ -304,10 +355,11 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
         if current_selection:
             selected_load = {}
             for opt in current_selection:
-                key = req_to_key[opt]
-                flows_for_req = res['request_flows'].get(key, {})
-                for edge, val in flows_for_req.items():
-                    selected_load[edge] = selected_load.get(edge, 0.0) + val
+                if opt in opt_to_key:
+                    r_key = opt_to_key[opt]
+                    flows_for_req = res['request_flows'].get(r_key, {})
+                    for edge, val in flows_for_req.items():
+                        selected_load[edge] = selected_load.get(edge, 0.0) + val
 
         fig = draw_interactive_heatmap(nodes, adj, caps, final_load, selected_load)
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
