@@ -1,10 +1,11 @@
 import numpy as np
 import random
+import time
 
-
-def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iterations=30, seed=42):
+def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iterations=30, time_limit_min=5, early_stop=True, seed=42):
     rng = np.random.RandomState(seed)
     DEFAULT_CAP = 0.0
+    start_time = time.time()
 
     pheromones = {
         u: {v: {dest: 1.0 for dest in destinations} for v in neighbors}
@@ -12,14 +13,19 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
     }
 
     history = []
+    best_delivered = -1
+    no_improve_iters = 0
 
-    # Pre-calculate node out-edges and capacities
     for iteration in range(n_iterations):
-        # Phase 1: ACO path finding
+        # ПУНКТ 5: Проверка времени
+        if time.time() - start_time > time_limit_min * 60:
+            print(f"ACO: Остановка по лимиту времени на итерации {iteration}")
+            break
+
         paths_found = {req: [] for req in requests.keys()}
 
         for (src, dst), volume in requests.items():
-            num_ants = min(int(volume / quantum) + 1, 50) # Limit max ants per request for performance
+            num_ants = min(int(volume / quantum) + 1, 50)
 
             for _ in range(num_ants):
                 current_node = src
@@ -37,7 +43,6 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                     for v in valid_neighbors:
                         edge = (current_node, v)
                         cap = capacities.get(edge, DEFAULT_CAP)
-                        # Avoid 0 capacity edges
                         if cap <= 0:
                             attr = 0.0
                         else:
@@ -57,7 +62,6 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                 if current_node == dst:
                     paths_found[(src, dst)].append(path)
 
-        # Update Pheromones
         for u in pheromones:
             for v in pheromones[u]:
                 for dest in pheromones[u][v]:
@@ -71,13 +75,11 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                     u, v = path[i], path[i + 1]
                     pheromones[u][v][dst] += 10.0 / path_length
 
-        # Phase 2: Flow allocation with proportional limits
         current_load = {edge: 0.0 for edge in capacities.keys()}
         delivered = {req: 0.0 for req in requests.keys()}
         request_flows = {req: {} for req in requests.keys()}
         successful_paths = []
 
-        # Determine the flow request for each edge
         edge_requests = {edge: [] for edge in capacities.keys()}
         all_path_allocs = []
 
@@ -85,7 +87,6 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
             paths = paths_found[req]
             if not paths: continue
 
-            # Count frequency of each unique path
             unique_paths = []
             path_counts = {}
             for p in paths:
@@ -95,7 +96,6 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                     path_counts[tp] = 0
                 path_counts[tp] += 1
 
-            # Distribute volume among found paths proportionally to ACO preference
             total_ants = len(paths)
             for p in unique_paths:
                 alloc_vol = volume * (path_counts[tuple(p)] / total_ants)
@@ -107,7 +107,6 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
                     if edge in edge_requests:
                         edge_requests[edge].append(path_obj)
 
-        # Iteratively scale down bottlenecks
         active_allocs = {id(po): po for po in all_path_allocs}
         path_scaling = {id(po): 1.0 for po in all_path_allocs}
 
@@ -120,17 +119,17 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
 
             total_req_vol = sum(po['vol'] for po in reqs_on_edge)
             if total_req_vol > cap:
-                # Proportional limitation based on original requested volume
                 scale_factor = cap / total_req_vol
                 for po in reqs_on_edge:
                     path_scaling[id(po)] = min(path_scaling[id(po)], scale_factor)
 
-        # Calculate final loads after scaling
+        iter_delivered_sum = 0.0
         for po in all_path_allocs:
             final_vol = po['vol'] * path_scaling[id(po)]
             if final_vol > 0.001:
                 p = po['path']
                 delivered[po['req']] += final_vol
+                iter_delivered_sum += final_vol
                 successful_paths.append((p, p[0], p[-1]))
                 for i in range(len(p) - 1):
                     edge = (p[i], p[i+1])
@@ -145,4 +144,15 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
             'request_flows': request_flows
         })
 
-    return history[-1]
+        # ПУНКТ 5: Ранняя остановка
+        if early_stop:
+            if iter_delivered_sum > best_delivered + 0.1:
+                best_delivered = iter_delivered_sum
+                no_improve_iters = 0
+            else:
+                no_improve_iters += 1
+                if no_improve_iters >= max(5, n_iterations // 5):
+                    print(f"ACO: Остановка по Early Stopping на {iteration} итерации")
+                    break
+
+    return history[-1] if history else {'load_distribution': {}, 'delivered': {}, 'request_flows': {}}

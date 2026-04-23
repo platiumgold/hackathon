@@ -4,6 +4,7 @@ import torch.optim as optim
 import networkx as nx
 from collections import defaultdict
 import numpy as np
+import time
 
 
 class StrictEnergyGNN(nn.Module):
@@ -44,7 +45,8 @@ class StrictEnergyGNN(nn.Module):
         return probs
 
 
-def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.005):
+def run_gnn(nodes, final_capacities, requests, epochs=50, time_limit_min=5, early_stop=True, lr=0.005):
+    start_time = time.time()
     num_nodes = len(nodes)
     node_idx = {name: i for i, name in enumerate(nodes)}
     reverse_node_idx = {i: name for i, name in enumerate(nodes)}
@@ -67,9 +69,17 @@ def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.005):
     model = StrictEnergyGNN(num_nodes, embed_dim=32)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
+    best_loss = float('inf')
+    patience_counter = 0
+
     # --- ЭТАП 1: Обучение GNN для понимания структуры графа ---
     model.train()
     for epoch in range(epochs):
+        # Проверка лимита времени (ПУНКТ 5)
+        if time.time() - start_time > time_limit_min * 60:
+            print(f"GNN: Остановка по лимиту времени на эпохе {epoch}")
+            break
+
         optimizer.zero_grad()
         total_loss = 0.0
 
@@ -85,6 +95,18 @@ def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.005):
         if total_loss > 0:
             total_loss.backward()
             optimizer.step()
+
+        # Логика ранней остановки (ПУНКТ 5)
+        if early_stop:
+            loss_val = total_loss.item()
+            if loss_val < best_loss - 0.001:
+                best_loss = loss_val
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter > 15:
+                    print(f"GNN: Ранняя остановка (Early Stop) на эпохе {epoch}")
+                    break
 
     # --- ЭТАП 2: Применение бизнес-логики (Evaluation & Routing) ---
     model.eval()
@@ -139,7 +161,7 @@ def run_gnn(nodes, final_capacities, requests, epochs=250, lr=0.005):
                     # Оставшаяся энергия просто не доставляется (срабатывает пропорциональное ограничение)
                     break
 
-                    # 3. Находим "узкое горлышко" на найденном пути
+                # 3. Находим "узкое горлышко" на найденном пути
                 path_edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
                 bottleneck_cap = min(current_capacities[e] for e in path_edges)
 

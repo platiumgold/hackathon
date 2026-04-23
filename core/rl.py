@@ -6,6 +6,7 @@ from torch.distributions import Normal
 import networkx as nx
 from itertools import islice
 from collections import defaultdict
+import time
 
 
 class PPOAgent(nn.Module):
@@ -21,7 +22,7 @@ class PPOAgent(nn.Module):
             nn.Linear(hidden_dim, action_dim)
         )
         self.actor_log_std = nn.Parameter(torch.ones(1, action_dim) * -0.5)
-        
+
         self.critic = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -48,19 +49,19 @@ class PowerRoutingEnv:
         self.paths_per_req = paths_per_req
         self.K_paths = K_paths
         self.max_steps = max_steps
-        
+
         self.edges = list(caps.keys())
         self.edge_idx = {e: i for i, e in enumerate(self.edges)}
         self.num_edges = len(self.edges)
-        
+
         self.cap_arr = np.array([caps.get(e, 1e-5) for e in self.edges])
         self.max_cap = np.max(self.cap_arr) if self.num_edges > 0 else 1.0
-        
+
         self.num_reqs = len(req_list)
         self.demands = np.array([r['amount'] for r in self.req_list])
         self.max_demand = np.max(self.demands) if self.num_reqs > 0 else 1.0
         self.total_demand = np.sum(self.demands) if self.num_reqs > 0 else 1.0
-        
+
         self.step_count = 0
         self.logits = np.zeros((self.num_reqs, self.K_paths))
         self.current_metric = 0.0
@@ -74,7 +75,7 @@ class PowerRoutingEnv:
             for k in range(self.req_list[r]['actual_k']):
                 path = self.paths_per_req[r][k]
                 for i in range(len(path) - 1):
-                    e = (path[i], path[i+1])
+                    e = (path[i], path[i + 1])
                     if e in self.edge_idx:
                         self._edge_req_paths[self.edge_idx[e]].append((r, k))
 
@@ -89,21 +90,21 @@ class PowerRoutingEnv:
         # Умножаем на 0.2, чтобы изменения были плавными и агент мог "нащупать" оптимум
         action = action.reshape((self.num_reqs, self.K_paths))
         self.logits += action * 0.2
-        
+
         # Ограничиваем логиты, чтобы Softmax не "залипал" в экстремальных значениях
         self.logits = np.clip(self.logits, -10.0, 10.0)
         self.step_count += 1
-        
+
         new_metric, new_delivered, new_edge_loads, new_actual_flows = self._evaluate_flow(self.logits)
-        
+
         # Награда: насколько лучше стало по сравнению с предыдущим состоянием
         reward = new_metric - self.current_metric
-        
+
         self.current_metric = new_metric
         self.total_delivered = new_delivered
         self.edge_loads = new_edge_loads
         self.actual_flows = new_actual_flows
-        
+
         done = (self.step_count >= self.max_steps)
         return self._get_state(), reward, done, {}
 
@@ -112,8 +113,8 @@ class PowerRoutingEnv:
         for r in range(self.num_reqs):
             actual_k = self.req_list[r]['actual_k']
             for k in range(actual_k, self.K_paths):
-                masked_logits[r, k] = -1e9 
-                
+                masked_logits[r, k] = -1e9
+
         max_logits = np.max(masked_logits, axis=1, keepdims=True)
         exp_L = np.exp(masked_logits - max_logits)
         return exp_L / np.sum(exp_L, axis=1, keepdims=True)
@@ -123,7 +124,7 @@ class PowerRoutingEnv:
         actual_flows = np.zeros((self.num_reqs, self.K_paths))
         for r in range(self.num_reqs):
             actual_flows[r] = probs[r] * self.req_list[r]['amount']
-            
+
         for _ in range(15):
             edge_loads = np.zeros(self.num_edges)
             for r in range(self.num_reqs):
@@ -131,45 +132,45 @@ class PowerRoutingEnv:
                     flow = actual_flows[r, k]
                     if flow <= 0: continue
                     path = self.paths_per_req[r][k]
-                    for i in range(len(path)-1):
-                        e = (path[i], path[i+1])
+                    for i in range(len(path) - 1):
+                        e = (path[i], path[i + 1])
                         if e in self.edge_idx:
                             edge_loads[self.edge_idx[e]] += flow
-                            
+
             overloaded = False
             scaling = np.ones((self.num_reqs, self.K_paths))
-            
+
             for e_idx in range(self.num_edges):
                 if edge_loads[e_idx] <= self.cap_arr[e_idx] + 1e-4:
                     continue
-                
+
                 overloaded = True
                 cap = self.cap_arr[e_idx]
-                
+
                 # Группируем потоки по запросам на этом ребре
                 req_flow_on_edge = defaultdict(float)
                 req_paths_on_edge = defaultdict(list)
-                
+
                 for (r, k) in self._edge_req_paths[e_idx]:
                     flow = actual_flows[r, k]
                     if flow > 0:
                         req_flow_on_edge[r] += flow
                         req_paths_on_edge[r].append(k)
-                
+
                 if not req_flow_on_edge:
                     continue
-                
+
                 # Water-filling: пропорционально исходным заявкам,
                 # но неиспользованная мощность перераспределяется
                 remaining_cap = cap
                 uncapped = set(req_flow_on_edge.keys())
                 final_alloc = {}
-                
+
                 while uncapped and remaining_cap > 1e-6:
                     total_demand_uncapped = sum(self.req_list[r]['amount'] for r in uncapped)
                     if total_demand_uncapped <= 0:
                         break
-                    
+
                     # Находим запросы, которым хватает их доли
                     fitted = set()
                     for r in uncapped:
@@ -177,17 +178,17 @@ class PowerRoutingEnv:
                         if req_flow_on_edge[r] <= share + 1e-6:
                             final_alloc[r] = req_flow_on_edge[r]
                             fitted.add(r)
-                    
+
                     if not fitted:
                         # Все оставшиеся превышают свою долю — режем пропорционально
                         for r in uncapped:
                             final_alloc[r] = remaining_cap * (self.req_list[r]['amount'] / total_demand_uncapped)
                         break
-                    
+
                     for r in fitted:
                         remaining_cap -= final_alloc[r]
                         uncapped.remove(r)
-                
+
                 # Применяем масштабирование
                 for r, alloc in final_alloc.items():
                     actual = req_flow_on_edge[r]
@@ -195,34 +196,34 @@ class PowerRoutingEnv:
                         local_scale = alloc / actual
                         for k in req_paths_on_edge[r]:
                             scaling[r, k] = min(scaling[r, k], local_scale)
-            
+
             actual_flows *= scaling
-            
+
             if not overloaded:
                 break
-                
+
         total_delivered = np.sum(actual_flows)
-        
+
         delivered_ratios = np.zeros(self.num_reqs)
         for r in range(self.num_reqs):
             deliv_r = np.sum(actual_flows[r, :self.req_list[r]['actual_k']])
             delivered_ratios[r] = deliv_r / (self.req_list[r]['amount'] + 1e-5)
-            
+
         variance_penalty = np.var(delivered_ratios)
         normalized_delivered = total_delivered / self.total_demand
-        
+
         metric = normalized_delivered - 0.5 * variance_penalty
-        
+
         final_edge_loads = np.zeros(self.num_edges)
         for r in range(self.num_reqs):
             for k in range(self.req_list[r]['actual_k']):
                 flow = actual_flows[r, k]
                 path = self.paths_per_req[r][k]
-                for i in range(len(path)-1):
-                    e = (path[i], path[i+1])
+                for i in range(len(path) - 1):
+                    e = (path[i], path[i + 1])
                     if e in self.edge_idx:
                         final_edge_loads[self.edge_idx[e]] += flow
-                        
+
         return metric, total_delivered, final_edge_loads, actual_flows
 
     def _get_state(self):
@@ -236,7 +237,7 @@ class PowerRoutingEnv:
         delivered_dict = {}
         load_distribution = defaultdict(float)
         request_flows = defaultdict(lambda: defaultdict(float))
-        
+
         for r in range(self.num_reqs):
             src = self.req_list[r]['src']
             dst = self.req_list[r]['dst']
@@ -247,14 +248,14 @@ class PowerRoutingEnv:
                 if flow <= 0: continue
                 delivered_r += flow
                 path = self.paths_per_req[r][k]
-                for i in range(len(path)-1):
-                    e = (path[i], path[i+1])
+                for i in range(len(path) - 1):
+                    e = (path[i], path[i + 1])
                     load_distribution[e] += flow
                     request_flows[req_key][e] += flow
             delivered_dict[req_key] = delivered_dict.get(req_key, 0.0) + delivered_r
-            
+
         return {
-            'load_distribution': dict(load_distribution), 
+            'load_distribution': dict(load_distribution),
             'delivered': delivered_dict,
             'request_flows': {req: dict(flows) for req, flows in request_flows.items()}
         }
@@ -268,7 +269,9 @@ def get_k_shortest_paths(G, source, target, k=3):
         return []
 
 
-def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, lr=3e-4):
+def run_rl(nodes, dests, adj, caps, reqs, epochs=None, time_limit_min=5, early_stop=True, K_paths=15, gamma=0.99,
+           lr=3e-4):
+    start_time = time.time()
     G = nx.DiGraph()
     G.add_nodes_from(nodes)
     for u in nodes:
@@ -282,7 +285,7 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
     for (src, dst), amount in reqs.items():
         if src in G.nodes and dst in G.nodes:
             paths = get_k_shortest_paths(G, src, dst, k=K_paths)
-            
+
             if paths:
                 actual_k = len(paths)
                 while len(paths) < K_paths:
@@ -290,9 +293,9 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
                 req_list.append({'src': src, 'dst': dst, 'amount': amount, 'actual_k': actual_k})
                 paths_per_req.append(paths)
             else:
-                print(f"⚠️ RL: Нет пути {src} → {dst} ({amount} кВт) — пропущено")
+                pass  # Ошибки путей теперь обрабатываются еще на этапе парсинга таблиц
         else:
-            print(f"⚠️ RL: Узел не в графе: {src} → {dst} ({amount} кВт) — пропущено")
+            pass
 
     num_requests = len(req_list)
     if num_requests == 0:
@@ -300,32 +303,32 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
 
     # Автоматический подбор гиперпараметров (Dynamic Scaling)
     complexity = len(caps) * num_requests
-    if complexity < 50:      # Очень простая сеть
+    if complexity < 50:  # Очень простая сеть
         auto_epochs = 60
         max_steps = 12
         batch_size = max_steps * 10  # 120 шагов (10 эпизодов)
-    elif complexity < 500:   # Средняя сеть
+    elif complexity < 500:  # Средняя сеть
         auto_epochs = 120
         max_steps = 16
         batch_size = max_steps * 16  # 256 шагов
-    else:                    # Сложная сеть
+    else:  # Сложная сеть
         auto_epochs = 200
         max_steps = 20
         batch_size = max_steps * 20  # 400 шагов
-        
+
     # Если пользователь явно передал epochs, используем его, иначе авто
     epochs = epochs if epochs is not None else auto_epochs
 
     env = PowerRoutingEnv(nodes, caps, req_list, paths_per_req, K_paths, max_steps=max_steps)
     # Отдельная среда для детерминированной оценки (Evaluation Mode)
     eval_env = PowerRoutingEnv(nodes, caps, req_list, paths_per_req, K_paths, max_steps=max_steps)
-    
+
     state_dim = env.num_edges + (env.num_reqs * K_paths) + env.num_reqs + env.num_edges
     action_dim = env.num_reqs * K_paths
-    
+
     agent = PPOAgent(state_dim, action_dim, hidden_dim=128)
     optimizer = optim.Adam(agent.parameters(), lr=lr)
-    
+
     # epochs теперь означает количество обновлений PPO (PPO Update Epochs)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -333,12 +336,17 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
     best_result = None
     best_delivered_kwt = 0.0
     no_improvement_count = 0
-    
+
     state = env.reset()
 
     for epoch in range(epochs):
+        # Проверка лимита времени (ПУНКТ 5)
+        if time.time() - start_time > time_limit_min * 60:
+            print(f"RL: Остановка по лимиту времени на эпохе {epoch}")
+            break
+
         states, actions, log_probs, rewards, values, dones = [], [], [], [], [], []
-        
+
         # 1. Сбор данных (Rollout)
         for _ in range(batch_size):
             state_tensor = torch.FloatTensor(state).unsqueeze(0)
@@ -347,22 +355,22 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
                 dist = Normal(mean, std)
                 action = dist.sample()
                 log_prob = dist.log_prob(action).sum(dim=-1)
-            
+
             action_np = action.squeeze(0).numpy()
             next_state, reward, done, _ = env.step(action_np)
-            
+
             states.append(state)
             actions.append(action_np)
             log_probs.append(log_prob.item())
             rewards.append(reward)
             values.append(value.item())
             dones.append(done)
-            
+
             state = next_state
-            
+
             if done:
                 state = env.reset()
-                
+
         # 2. Оценка детерминированной политики (Evaluation Mode без шума)
         eval_state = eval_env.reset()
         for _ in range(eval_env.max_steps):
@@ -372,7 +380,7 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
             eval_state, _, eval_done, _ = eval_env.step(mean.squeeze(0).numpy())
             if eval_done:
                 break
-                
+
         if eval_env.current_metric > best_metric_val + 1e-6:
             best_metric_val = eval_env.current_metric
             best_result = eval_env.get_final_flows()
@@ -381,69 +389,71 @@ def run_rl(nodes, dests, adj, caps, reqs, epochs=None, K_paths=15, gamma=0.99, l
         else:
             no_improvement_count += 1
 
-        if no_improvement_count >= 20:
+        # Ранняя остановка (ПУНКТ 5)
+        if early_stop and no_improvement_count >= 20:
             print(f"--- Ранняя остановка на эпохе {epoch} (результат стабилизировался) ---")
             break
-                
+
         # 3. Обновление PPO (GAE)
         returns = []
         advantages = []
         gae = 0
         lam = 0.95
-        
+
         state_tensor = torch.FloatTensor(state).unsqueeze(0)
         with torch.no_grad():
             _, _, next_val = agent(state_tensor)
             next_val = next_val.item()
-            
+
         for i in reversed(range(len(rewards))):
             if i == len(rewards) - 1:
                 next_non_terminal = 1.0 - dones[i]
                 next_value = next_val
             else:
                 next_non_terminal = 1.0 - dones[i]
-                next_value = values[i+1]
-                
+                next_value = values[i + 1]
+
             delta = rewards[i] + gamma * next_value * next_non_terminal - values[i]
             gae = delta + gamma * lam * next_non_terminal * gae
             advantages.insert(0, gae)
             returns.insert(0, gae + values[i])
-            
+
         states_t = torch.FloatTensor(np.array(states))
         actions_t = torch.FloatTensor(np.array(actions))
         old_log_probs_t = torch.FloatTensor(np.array(log_probs))
         returns_t = torch.FloatTensor(np.array(returns))
         advantages_t = torch.FloatTensor(np.array(advantages))
-        
+
         advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
-        
+
         # Обновление сети 4 раза на собранном батче
         for _ in range(4):
             mean, std, value = agent(states_t)
             dist = Normal(mean, std)
             new_log_probs = dist.log_prob(actions_t).sum(dim=-1)
             ratio = torch.exp(new_log_probs - old_log_probs_t)
-            
+
             surr1 = ratio * advantages_t
             surr2 = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2) * advantages_t
             actor_loss = -torch.min(surr1, surr2).mean()
-            
+
             critic_loss = nn.MSELoss()(value.squeeze(-1), returns_t)
             entropy = dist.entropy().mean()
-            
+
             loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
-            
+
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
             optimizer.step()
-            
+
         scheduler.step()
-        
+
         # Логирование прогресса каждые 10% от общего числа эпох (или на первой эпохе)
         print_interval = max(1, epochs // 10)
         if (epoch + 1) % print_interval == 0 or epoch == 0:
             avg_ratio = eval_env.total_delivered / eval_env.total_demand
-            print(f"Epoch {epoch+1:4d}/{epochs} | Fairness Metric: {eval_env.current_metric:.4f} | Avg Delivery: {avg_ratio:.2%} | Delivered: {eval_env.total_delivered:.1f} kW")
+            print(
+                f"Epoch {epoch + 1:4d}/{epochs} | Fairness Metric: {eval_env.current_metric:.4f} | Avg Delivery: {avg_ratio:.2%} | Delivered: {eval_env.total_delivered:.1f} kW")
 
     return best_result if best_result else {'load_distribution': {}, 'delivered': {}}

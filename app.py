@@ -16,8 +16,8 @@ st.set_page_config(page_title="MVP Маршрутизации Энергии", l
 def reset_results():
     st.session_state.res = None
 
+
 def toggle_request(opt_label):
-    """Добавляет или удаляет заявку из глобального выбора"""
     current = st.session_state.get("req_selector", [])
     if opt_label in current:
         current.remove(opt_label)
@@ -71,11 +71,12 @@ def process_pdf_cap(file):
     return pd.DataFrame(cleaned, columns=["начало", "окончание", "Допустимая мощность"])
 
 
-# --- Инициализация состояния сессии ---
-if 'df_req' not in st.session_state:
-    st.session_state.df_req = None
-if 'df_cap' not in st.session_state:
-    st.session_state.df_cap = None
+# ПУНКТ 2: Инициализация состояния сессии со стандартными данными
+if 'df_req' not in st.session_state or 'df_cap' not in st.session_state:
+    r, c = generate_synthetic_network(15, 100.0, 0.4)
+    if 'df_req' not in st.session_state: st.session_state.df_req = r
+    if 'df_cap' not in st.session_state: st.session_state.df_cap = c
+
 if 'res' not in st.session_state:
     st.session_state.res = None
 if 'algo_run' not in st.session_state:
@@ -85,7 +86,7 @@ if 'reversed_logical_edges' not in st.session_state:
 if 'potentially_reversible' not in st.session_state:
     st.session_state.potentially_reversible = [('VI.', 'V.')]
 if 'nodes_info' not in st.session_state:
-    st.session_state.nodes_info = ([], [], {}, {}, {})
+    st.session_state.nodes_info = ([], [], {}, {}, {}, [])
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
 st.markdown("**Интеллектуальная система диспетчеризации (ИИ)** на базе гибридных алгоритмов.")
@@ -95,8 +96,9 @@ st.sidebar.header("📥 Входные данные")
 file_req = st.sidebar.file_uploader("Загрузить Заявки (CSV/Excel/PDF)", type=['csv', 'xlsx', 'pdf'])
 file_cap = st.sidebar.file_uploader("Загрузить Ограничения (CSV/Excel/PDF)", type=['csv', 'xlsx', 'pdf'])
 
-if file_req and file_cap:
-    if st.sidebar.button("📁 Применить загруженные файлы"):
+if st.sidebar.button("📁 Применить загруженные файлы"):
+    # Обрабатываем только те, что загружены
+    if file_req:
         if file_req.name.endswith('.pdf'):
             st.session_state.df_req = process_pdf_req(file_req)
         elif file_req.name.endswith('.xlsx'):
@@ -104,15 +106,16 @@ if file_req and file_cap:
         else:
             st.session_state.df_req = pd.read_csv(file_req)
 
+    if file_cap:
         if file_cap.name.endswith('.pdf'):
             st.session_state.df_cap = process_pdf_cap(file_cap)
         elif file_cap.name.endswith('.xlsx'):
             st.session_state.df_cap = pd.read_excel(file_cap)
         else:
             st.session_state.df_cap = pd.read_csv(file_cap)
-        
-        reset_results()
-        st.sidebar.success("Файлы загружены и закреплены!")
+
+    reset_results()
+    st.sidebar.success("Файлы загружены и закреплены!")
 
 st.sidebar.markdown("---")
 st.sidebar.header("🧪 Генерация сценария")
@@ -125,11 +128,11 @@ with st.sidebar.expander("Настройки генератора"):
         st.session_state.df_req = df_r
         st.session_state.df_cap = df_c
         reset_results()
-        st.sidebar.success("Сценарий сгенерирован и закреплен!")
+        st.sidebar.success("Сценарий сгенерирован!")
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Пульт управления реверсом")
-
+# ПУНКТ 4: Убрана возможность добавлять ребра
 for edge in st.session_state.potentially_reversible:
     u, v = edge
     is_active = edge in st.session_state.reversed_logical_edges
@@ -142,31 +145,37 @@ for edge in st.session_state.potentially_reversible:
         reset_results()
         st.rerun()
 
-st.sidebar.markdown("<br>", unsafe_allow_html=True)
-all_logical = get_logical_edges()
-available_to_add = [f"{u} → {v}" for u, v in all_logical
-                    if (u, v) not in st.session_state.potentially_reversible]
-
-with st.sidebar.expander("➕ Добавить участок в пульт"):
-    new_edge_str = st.selectbox("Выберите участок:", options=available_to_add, key="add_rev_select")
-    if st.button("Добавить в список управления", use_container_width=True):
-        if new_edge_str:
-            u_n, v_n = new_edge_str.split(" → ")
-            st.session_state.potentially_reversible.append((u_n, v_n))
-            reset_results()
-            st.rerun()
-
+st.sidebar.markdown("---")
 algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ",
                         ["Physics-Informed GNN", "Ant Colony (ACO)", "Reinforcement Learning (PPO)"])
+
+# ПУНКТ 5: Настройки алгоритмов
+with st.sidebar.expander("🛠 Настройки обучения"):
+    if algo == "Ant Colony (ACO)":
+        epochs = st.number_input("Кол-во итераций", min_value=10, max_value=500, value=30)
+    else:
+        epochs = st.number_input("Максимум эпох", min_value=10, max_value=1000, value=150)
+
+    time_limit = st.slider("Ограничение по времени (мин)", 1, 60, 5)
+    use_early_stop = st.checkbox("Ранняя остановка (Early Stop)", value=True,
+                                 help="Остановить обучение, если метрики перестали улучшаться.")
 
 run_btn = st.sidebar.button("🚀 ЗАПУСТИТЬ РАСЧЕТ", type="primary", use_container_width=True)
 
 # --- ГЛОБАЛЬНАЯ ПОДГОТОВКА ТОПОЛОГИИ ---
 current_topo = get_current_topology(st.session_state.reversed_logical_edges)
-nodes, dests, adj, caps, reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap, current_topo)
-st.session_state.nodes_info = (nodes, dests, adj, caps, reqs)
+# Получаем 6 значений, включая список невалидных заявок
+nodes, dests, adj, caps, reqs, invalid_reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap,
+                                                                current_topo)
+st.session_state.nodes_info = (nodes, dests, adj, caps, reqs, invalid_reqs)
 
-# --- Основная область: Редактирование и Расчет ---
+# ПУНКТ 6: Вывод уведомления об отсутствии путей
+if invalid_reqs:
+    st.warning(f"⚠️ Внимание! Обнаружено {len(invalid_reqs)} заявок без физического пути. Они исключены из обучения.")
+    with st.expander("Посмотреть недостижимые заявки"):
+        st.dataframe(pd.DataFrame(invalid_reqs))
+
+# --- Основная область ---
 if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
     st.subheader("📝 Масштабирование и ручное редактирование данных")
@@ -175,30 +184,34 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Таблица 1.1: Заявки (Редактируемо)**")
-        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True, on_change=reset_results)
+        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True,
+                                    on_change=reset_results)
     with c2:
         st.markdown("**Таблица 1.2: Доп. мощности (Редактируемо)**")
-        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True, on_change=reset_results)
+        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True,
+                                    on_change=reset_results)
 
     st.session_state.df_req = edited_req
     st.session_state.df_cap = edited_cap
 
     if run_btn:
         res = None
-        with st.spinner(f'Работает {algo}...'):
+        with st.spinner(f'Работает {algo}... Пожалуйста, подождите.'):
             if algo == "Ant Colony (ACO)":
-                res = run_aco(nodes, dests, adj, caps, reqs)
+                res = run_aco(nodes, dests, adj, caps, reqs, n_iterations=epochs, time_limit_min=time_limit,
+                              early_stop=use_early_stop)
             elif algo == "Physics-Informed GNN":
-                res = run_gnn(nodes, caps, reqs, epochs=250)
+                res = run_gnn(nodes, caps, reqs, epochs=epochs, time_limit_min=time_limit, early_stop=use_early_stop)
             elif algo == "Reinforcement Learning (PPO)":
-                res = run_rl(nodes, dests, adj, caps, reqs)
+                res = run_rl(nodes, dests, adj, caps, reqs, epochs=epochs, time_limit_min=time_limit,
+                             early_stop=use_early_stop)
 
             st.session_state.res = res
             st.session_state.algo_run = algo
             st.sidebar.success("Расчет завершен!")
 
     if st.session_state.res is not None:
-        nodes, dests, adj, caps, reqs = st.session_state.nodes_info
+        nodes, dests, adj, caps, reqs, _ = st.session_state.nodes_info
         res = st.session_state.res
         final_load = res.get('load_distribution', {})
         total_delivered = sum(res.get('delivered', {}).values())
@@ -208,7 +221,8 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
         col1.metric("Запрошено мощности", f"{total_requested:.3f} кВт")
         col2.metric("Фактически доставлено", f"{total_delivered:.3f} кВт")
 
-        st.info("💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков.")
+        st.info(
+            "💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков.")
 
         st.markdown("---")
         st.subheader("🛠️ Инспектор участков")
@@ -269,14 +283,15 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                                 cb_label = f"{item['Заявка']} | **Вклад: {flow_val:.3f} кВт**"
                                 st.checkbox(cb_label, value=is_checked, key=f"cb_{r_key[0]}_{r_key[1]}",
                                             on_change=toggle_request, args=(opt_label,))
-                    
+
                     with col_ins2:
-                        if st.button("✨ Подсветить все на этом участке", use_container_width=True):
+                        if st.button("✨ Подсветить все на участке", use_container_width=True):
                             new_sel = list(set(current_selection + [req_to_opt[i['key']] for i in breakdown_data]))
                             st.session_state.req_selector = new_sel
                             st.rerun()
-                        if st.button("🧹 Скрыть все на этом участке", use_container_width=True):
-                            new_sel = [s for s in current_selection if s not in [req_to_opt[i['key']] for i in breakdown_data]]
+                        if st.button("🧹 Скрыть все на участке", use_container_width=True):
+                            new_sel = [s for s in current_selection if
+                                       s not in [req_to_opt[i['key']] for i in breakdown_data]]
                             st.session_state.req_selector = new_sel
                             st.rerun()
 
@@ -321,10 +336,3 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
         st.info("Для расчета потоков нажмите «Запустить расчет».")
         fig = draw_interactive_heatmap(nodes, adj, caps, {})
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
-
-else:
-    st.subheader("🗺️ Базовая топология сети «Альфа»")
-    nodes, dests, adj, caps, reqs = st.session_state.nodes_info
-    fig = draw_interactive_heatmap(nodes, adj, caps, {})
-    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
-    st.info("👋 Пожалуйста, загрузите файлы или сгенерируйте сценарий в боковом меню.")
