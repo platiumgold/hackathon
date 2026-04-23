@@ -71,7 +71,18 @@ def process_pdf_cap(file):
     return pd.DataFrame(cleaned, columns=["начало", "окончание", "Допустимая мощность"])
 
 
-# ПУНКТ 2: Инициализация состояния сессии со стандартными данными
+# Функция для жесткого сброса кэша таблиц при загрузке новых данных
+def apply_new_data(df_r, df_c):
+    st.session_state.df_req = df_r
+    st.session_state.df_cap = df_c
+    if "editor_req" in st.session_state:
+        del st.session_state["editor_req"]
+    if "editor_cap" in st.session_state:
+        del st.session_state["editor_cap"]
+    reset_results()
+
+
+# --- ИНИЦИАЛИЗАЦИЯ СТАНДАРТНЫХ ДАННЫХ В СЕССИИ ---
 if 'df_req' not in st.session_state or 'df_cap' not in st.session_state:
     r, c = generate_synthetic_network(15, 100.0, 0.4)
     if 'df_req' not in st.session_state: st.session_state.df_req = r
@@ -83,38 +94,43 @@ if 'algo_run' not in st.session_state:
     st.session_state.algo_run = ""
 if 'reversed_logical_edges' not in st.session_state:
     st.session_state.reversed_logical_edges = []
-if 'potentially_reversible' not in st.session_state:
-    st.session_state.potentially_reversible = [('VI.', 'V.')]
-if 'nodes_info' not in st.session_state:
-    st.session_state.nodes_info = ([], [], {}, {}, {}, [])
+
+# Динамический сбор всех доступных логических ребер для пульта реверса
+if 'all_logical_edges' not in st.session_state:
+    st.session_state.all_logical_edges = get_logical_edges()
+# То, что сейчас выведено на панель управления реверсом
+if 'visible_toggles' not in st.session_state:
+    st.session_state.visible_toggles = [('VI.', 'V.')]
 
 st.title("⚡ MVP: Оптимизация распределенной электрической сети «Альфа»")
 st.markdown("**Интеллектуальная система диспетчеризации (ИИ)** на базе гибридных алгоритмов.")
 
-# --- Боковая панель ---
+# ==========================================
+# БОКОВАЯ ПАНЕЛЬ: ВВОД И НАСТРОЙКИ
+# ==========================================
 st.sidebar.header("📥 Входные данные")
 file_req = st.sidebar.file_uploader("Загрузить Заявки (CSV/Excel/PDF)", type=['csv', 'xlsx', 'pdf'])
 file_cap = st.sidebar.file_uploader("Загрузить Ограничения (CSV/Excel/PDF)", type=['csv', 'xlsx', 'pdf'])
 
 if st.sidebar.button("📁 Применить загруженные файлы"):
-    # Обрабатываем только те, что загружены
+    new_req = st.session_state.df_req
+    new_cap = st.session_state.df_cap
     if file_req:
         if file_req.name.endswith('.pdf'):
-            st.session_state.df_req = process_pdf_req(file_req)
+            new_req = process_pdf_req(file_req)
         elif file_req.name.endswith('.xlsx'):
-            st.session_state.df_req = pd.read_excel(file_req)
+            new_req = pd.read_excel(file_req)
         else:
-            st.session_state.df_req = pd.read_csv(file_req)
-
+            new_req = pd.read_csv(file_req)
     if file_cap:
         if file_cap.name.endswith('.pdf'):
-            st.session_state.df_cap = process_pdf_cap(file_cap)
+            new_cap = process_pdf_cap(file_cap)
         elif file_cap.name.endswith('.xlsx'):
-            st.session_state.df_cap = pd.read_excel(file_cap)
+            new_cap = pd.read_excel(file_cap)
         else:
-            st.session_state.df_cap = pd.read_csv(file_cap)
+            new_cap = pd.read_csv(file_cap)
 
-    reset_results()
+    apply_new_data(new_req, new_cap)
     st.sidebar.success("Файлы загружены и закреплены!")
 
 st.sidebar.markdown("---")
@@ -125,75 +141,113 @@ with st.sidebar.expander("Настройки генератора"):
     bottleneck = st.slider("Степень дефицита (0-1)", 0.0, 1.0, 0.4)
     if st.button("🏗️ Сгенерировать новый сценарий"):
         df_r, df_c = generate_synthetic_network(n_req, load_val, bottleneck)
-        st.session_state.df_req = df_r
-        st.session_state.df_cap = df_c
-        reset_results()
+        apply_new_data(df_r, df_c)
         st.sidebar.success("Сценарий сгенерирован!")
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Пульт управления реверсом")
-# ПУНКТ 4: Убрана возможность добавлять ребра
-for edge in st.session_state.potentially_reversible:
+
+edge_options = [f"{u} → {v}" for u, v in st.session_state.all_logical_edges]
+selected_edge_str = st.sidebar.selectbox("Добавить участок на пульт:", ["-- выберите участок --"] + edge_options)
+if st.sidebar.button("➕ Добавить переключатель", use_container_width=True):
+    if selected_edge_str != "-- выберите участок --":
+        u, v = selected_edge_str.split(" → ")
+        edge = (u.strip(), v.strip())
+        if edge not in st.session_state.visible_toggles:
+            st.session_state.visible_toggles.append(edge)
+            st.rerun()
+
+st.sidebar.markdown("**Активные переключатели направления:**")
+for edge in st.session_state.visible_toggles:
     u, v = edge
     is_active = edge in st.session_state.reversed_logical_edges
-    label = f"{'🔄' if is_active else '➡️'} {u} ↔ {v}"
-    if st.sidebar.button(label, key=f"btn_rev_{u}_{v}", use_container_width=True):
-        if is_active:
-            st.session_state.reversed_logical_edges.remove(edge)
-        else:
-            st.session_state.reversed_logical_edges.append(edge)
-        reset_results()
-        st.rerun()
+
+    label = f"🔄 Направлен {v} → {u}" if is_active else f"➡️ Направлен {u} → {v}"
+
+    col_btn, col_del = st.sidebar.columns([5, 1])
+    with col_btn:
+        if st.button(label, key=f"btn_rev_{u}_{v}", use_container_width=True):
+            if is_active:
+                st.session_state.reversed_logical_edges.remove(edge)
+            else:
+                st.session_state.reversed_logical_edges.append(edge)
+            reset_results()
+            st.rerun()
+    with col_del:
+        if st.button("✖", key=f"del_rev_{u}_{v}", help="Убрать с пульта"):
+            st.session_state.visible_toggles.remove(edge)
+            if is_active:
+                st.session_state.reversed_logical_edges.remove(edge)
+            reset_results()
+            st.rerun()
 
 st.sidebar.markdown("---")
 algo = st.sidebar.radio("🤖 Выбор алгоритма ИИ",
                         ["Physics-Informed GNN", "Ant Colony (ACO)", "Reinforcement Learning (PPO)"])
 
-# ПУНКТ 5: Настройки алгоритмов
 with st.sidebar.expander("🛠 Настройки обучения"):
     if algo == "Ant Colony (ACO)":
         epochs = st.number_input("Кол-во итераций", min_value=10, max_value=500, value=30)
     else:
         epochs = st.number_input("Максимум эпох", min_value=10, max_value=1000, value=150)
-
     time_limit = st.slider("Ограничение по времени (мин)", 1, 60, 5)
-    use_early_stop = st.checkbox("Ранняя остановка (Early Stop)", value=True,
-                                 help="Остановить обучение, если метрики перестали улучшаться.")
+    use_early_stop = st.checkbox("Ранняя остановка (Early Stop)", value=True)
 
 run_btn = st.sidebar.button("🚀 ЗАПУСТИТЬ РАСЧЕТ", type="primary", use_container_width=True)
 
-# --- ГЛОБАЛЬНАЯ ПОДГОТОВКА ТОПОЛОГИИ ---
-current_topo = get_current_topology(st.session_state.reversed_logical_edges)
-# Получаем 6 значений, включая список невалидных заявок
-nodes, dests, adj, caps, reqs, invalid_reqs = load_network_data(st.session_state.df_req, st.session_state.df_cap,
-                                                                current_topo)
-st.session_state.nodes_info = (nodes, dests, adj, caps, reqs, invalid_reqs)
-
-# ПУНКТ 6: Вывод уведомления об отсутствии путей
-if invalid_reqs:
-    st.warning(f"⚠️ Внимание! Обнаружено {len(invalid_reqs)} заявок без физического пути. Они исключены из обучения.")
-    with st.expander("Посмотреть недостижимые заявки"):
-        st.dataframe(pd.DataFrame(invalid_reqs))
-
-# --- Основная область ---
+# ==========================================
+# ОСНОВНАЯ ОБЛАСТЬ: РЕДАКТИРОВАНИЕ ДАННЫХ
+# ==========================================
 if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
     st.subheader("📝 Масштабирование и ручное редактирование данных")
-    st.info("💡 **Вы можете менять числа прямо в таблицах ниже.** Все ваши правки будут учтены при запуске.")
+    st.info("💡 **Вы можете менять числа, добавлять и удалять строки.** Все правки учитываются мгновенно.")
 
     c1, c2 = st.columns(2)
+    # Используем новые независимые переменные для редактора, чтобы избежать "залипания"
     with c1:
         st.markdown("**Таблица 1.1: Заявки (Редактируемо)**")
-        edited_req = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True,
-                                    on_change=reset_results)
+        df_req_edited = st.data_editor(
+            st.session_state.df_req, num_rows="dynamic", use_container_width=True,
+            on_change=reset_results, key="editor_req"
+        )
     with c2:
         st.markdown("**Таблица 1.2: Доп. мощности (Редактируемо)**")
-        edited_cap = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True,
-                                    on_change=reset_results)
+        df_cap_edited = st.data_editor(
+            st.session_state.df_cap, num_rows="dynamic", use_container_width=True,
+            on_change=reset_results, key="editor_cap"
+        )
 
-    st.session_state.df_req = edited_req
-    st.session_state.df_cap = edited_cap
+    # ==========================================
+    # РАСЧЕТ ДОСТУПНОСТИ ПУТЕЙ (В РЕАЛЬНОМ ВРЕМЕНИ)
+    # ==========================================
+    current_topo = get_current_topology(st.session_state.reversed_logical_edges)
+    nodes, dests, adj, caps, reqs, invalid_reqs = load_network_data(
+        df_req_edited, df_cap_edited, current_topo
+    )
+    st.session_state.nodes_info = (nodes, dests, adj, caps, reqs, invalid_reqs)
 
+    # ==========================================
+    # УВЕДОМЛЕНИЯ О НЕДОСТИЖИМЫХ ЗАЯВКАХ
+    # ==========================================
+    st.markdown("---")
+    if len(invalid_reqs) > 0:
+        st.error(f"⚠️ **ВНИМАНИЕ! Обнаружено {len(invalid_reqs)} невыполнимых заявок.**\n\n"
+                 f"От Источника до Потребителя **нет физического пути** с учётом текущего направления участков сети. "
+                 f"Они будут исключены из расчёта.\n\n"
+                 f"*(Совет: Измените направление участков на пульте реверса слева).*")
+        with st.expander("Посмотреть недостижимые заявки"):
+            st.dataframe(pd.DataFrame(invalid_reqs), use_container_width=True)
+    else:
+        if len(reqs) > 0:
+            st.success(
+                "✅ **Всё отлично, маршрутизация возможна!**\n\nВсе заявленные потребители имеют физический путь от источников. Ошибок в топологии нет.")
+        else:
+            st.info("ℹ️ **Нет активных заявок.** Добавьте заявки в таблицу 1.1.")
+
+    # ==========================================
+    # ЗАПУСК АЛГОРИТМОВ
+    # ==========================================
     if run_btn:
         res = None
         with st.spinner(f'Работает {algo}... Пожалуйста, подождите.'):
@@ -208,21 +262,22 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
             st.session_state.res = res
             st.session_state.algo_run = algo
-            st.sidebar.success("Расчет завершен!")
+            st.success("Расчет завершен!")
 
+    # ==========================================
+    # ОТРИСОВКА РЕЗУЛЬТАТОВ И КАРТЫ
+    # ==========================================
     if st.session_state.res is not None:
-        nodes, dests, adj, caps, reqs, _ = st.session_state.nodes_info
         res = st.session_state.res
         final_load = res.get('load_distribution', {})
         total_delivered = sum(res.get('delivered', {}).values())
         total_requested = sum(reqs.values())
 
         col1, col2 = st.columns(2)
-        col1.metric("Запрошено мощности", f"{total_requested:.3f} кВт")
-        col2.metric("Фактически доставлено", f"{total_delivered:.3f} кВт")
+        col1.metric("Запрошено мощности (допустимые пути)", f"{total_requested:.3f} кВт")
+        col2.metric("Фактически доставлено алгоритмом", f"{total_delivered:.3f} кВт")
 
-        st.info(
-            "💡 **Отчет диспетчера:** Алгоритм пропорционально ограничил заявки для предотвращения перегрузки участков.")
+        st.info("💡 **Отчет диспетчера:** Алгоритм пропорционально распределил мощности для предотвращения перегрузки.")
 
         st.markdown("---")
         st.subheader("🛠️ Инспектор участков")
@@ -239,12 +294,12 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                 })
 
         edge_list = sorted(edge_list, key=lambda x: x['ratio'], reverse=True)
-        edge_options = [e['label'] for e in edge_list]
+        edge_options_select = [e['label'] for e in edge_list]
 
         col_ins1, col_ins2 = st.columns([2, 1])
         with col_ins1:
             selected_edge_label = st.selectbox("Посмотреть, кто нагружает участок:",
-                                               options=["-- выберите участок --"] + edge_options)
+                                               options=["-- выберите участок --"] + edge_options_select)
 
         available_reqs = list(res['request_flows'].keys())
         req_to_opt = {}
@@ -273,7 +328,6 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                 if breakdown_data:
                     with col_ins1:
                         with st.expander(f"⚙️ Управление потоками участка: {selected_edge_label}", expanded=True):
-                            st.write("Выберите заявки для отображения маршрутов:")
                             current_selection = st.session_state.get("req_selector", [])
                             for item in breakdown_data:
                                 r_key = item['key']
@@ -296,7 +350,7 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                             st.rerun()
 
         st.subheader("🗺️ Визуализация потоков")
-        selected_opts = st.multiselect("🔍 Выберите заявки (пусто = общая нагрузка):",
+        selected_opts = st.multiselect("🔍 Выберите конкретные заявки (пусто = отображать общую нагрузку):",
                                        options=req_options, key="req_selector")
 
         selected_load = None
@@ -310,11 +364,12 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                     for edge, val in flows_for_req.items():
                         selected_load[edge] = selected_load.get(edge, 0.0) + val
 
+        # График теперь рисуется с обновленными после реверса участками
         fig = draw_interactive_heatmap(nodes, adj, caps, final_load, selected_load)
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
         st.markdown("---")
-        st.subheader("📊 Анализ справедливости")
+        st.subheader("📊 Анализ справедливости распределения")
         req_stats = []
         for (src, dst), req_val in reqs.items():
             deliv_val = res['delivered'].get((src, dst), 0.0)
@@ -333,6 +388,6 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
 
     if st.session_state.res is None:
         st.subheader("🗺️ Базовая топология сети")
-        st.info("Для расчета потоков нажмите «Запустить расчет».")
+        st.info("Для расчета потоков нажмите «Запустить расчет» в левом меню.")
         fig = draw_interactive_heatmap(nodes, adj, caps, {})
         st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
