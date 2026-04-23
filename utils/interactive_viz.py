@@ -55,10 +55,10 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
 
         if selected_load is not None:
             mid_text.append(
-                f"Участок: {u} ↔ {v}<br>Заявка: <b>{s_load:.1f} кВт</b><br>Всего: {t_load:.1f} кВт<br>Макс: {cap:.0f} кВт")
+                f"Участок: {u} ↔ {v}<br>Заявка: <b>{s_load:.3f} кВт</b><br>Всего: {t_load:.3f} кВт<br>Макс: {cap:.3f} кВт")
         else:
             mid_text.append(
-                f"Участок: {u} ↔ {v}<br>Нагрузка: <b>{t_load:.1f} из {cap:.0f} кВт</b><br>Загруженность: {ratio * 100:.1f}%")
+                f"Участок: {u} ↔ {v}<br>Нагрузка: <b>{t_load:.3f} из {cap:.3f} кВт</b><br>Загруженность: {ratio * 100:.3f}%")
 
         # Вектор направления (по умолчанию по топологии схемы u -> v)
         start_x, start_y, end_x, end_y = x0, y0, x1, y1
