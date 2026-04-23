@@ -69,21 +69,22 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         dy = end_y - start_y
         dist = math.hypot(dx, dy)
 
-        # РИСУЕМ СТРЕЛКУ ВСЕГДА
+        # РИСУЕМ СТРЕЛКУ (более компактную и аккуратную)
         if dist > 0:
             nx, ny = dx / dist, dy / dist
-            arrow_len = min(0.5, dist * 0.25)
+            # Короткая стрелка, чтобы не перекрывать узлы
+            arrow_len = min(0.2, dist * 0.1) 
 
             fig.add_annotation(
                 x=mx + nx * arrow_len, y=my + ny * arrow_len,
                 ax=mx - nx * arrow_len, ay=my - ny * arrow_len,
                 xref='x', yref='y', axref='x', ayref='y',
                 showarrow=True,
-                arrowhead=2,
-                arrowsize=1.5,
-                arrowwidth=width,
+                arrowhead=3, # Более изящный наконечник
+                arrowsize=1, # В два раза меньше
+                arrowwidth=min(2, width), # Тоньше
                 arrowcolor=color,
-                opacity=opacity
+                opacity=opacity * 0.8 # Чуть прозрачнее
             )
 
     # 2. Отрисовка невидимых точек для HOVER-текста
