@@ -5,14 +5,27 @@ import networkx as nx
 from collections import defaultdict
 import numpy as np
 import time
+from typing import List, Dict, Tuple, Any, Optional, Set, Union
 
 
 class StrictEnergyGNN(nn.Module):
-    def __init__(self, num_nodes, embed_dim=32):
+    """
+    Графовая нейронная сеть (GNN) для оценки вероятностей перетоков.
+    
+    Использует эмбеддинги узлов и MLP для предсказания привлекательности ребер
+    в зависимости от топологии и целевого узла (потребителя).
+    """
+    def __init__(self, num_nodes: int, embed_dim: int = 32):
+        """
+        Args:
+            num_nodes: Общее количество узлов в сети.
+            embed_dim: Размерность вектора признаков (эмбеддинга) узла.
+        """
         super().__init__()
         self.num_nodes = num_nodes
         self.node_embed = nn.Embedding(num_nodes, embed_dim)
 
+        # Слой для вычисления весов ребер на основе признаков (Source, Target, Destination)
         self.edge_mlp = nn.Sequential(
             nn.Linear(embed_dim * 3, 64),
             nn.LayerNorm(64),
@@ -22,8 +35,17 @@ class StrictEnergyGNN(nn.Module):
             nn.Linear(32, 1)
         )
 
-    def get_edge_probabilities(self, adj_mask, dst_idx):
-        """Считает вероятности перехода по ребрам на основе графовых признаков"""
+    def get_edge_probabilities(self, adj_mask: torch.Tensor, dst_idx: int) -> torch.Tensor:
+        """
+        Вычисляет вероятности перехода между узлами.
+        
+        Args:
+            adj_mask: Матрица смежности (1.0 если связь есть, иначе 0.0).
+            dst_idx: Индекс узла-потребителя (цель потока).
+            
+        Returns:
+            torch.Tensor: Матрица вероятностей [N x N].
+        """
         emb = self.node_embed.weight
         dst_emb = emb[dst_idx].expand(self.num_nodes, -1)
 
@@ -31,6 +53,7 @@ class StrictEnergyGNN(nn.Module):
         for i in range(self.num_nodes):
             neighbors = torch.where(adj_mask[i] > 0)[0]
             if len(neighbors) > 0:
+                # Вход: признаки текущего узла, соседа и финальной цели
                 e_in = torch.cat([
                     emb[i].expand(len(neighbors), -1),
                     emb[neighbors],
@@ -38,19 +61,42 @@ class StrictEnergyGNN(nn.Module):
                 ], dim=1)
                 edge_logits[i, neighbors] = self.edge_mlp(e_in).squeeze(-1)
 
-        # Нормализуем вероятности для каждого узла
+        # Softmax для получения вероятностей (сумма по строке = 1.0)
         probs = torch.softmax(edge_logits, dim=1)
-        # Убираем вероятности там, где нет физических связей
+        # Маскирование (только физически существующие ребра)
         probs = probs * adj_mask
         return probs
 
 
-def run_gnn(nodes, final_capacities, requests, epochs=50, time_limit_min=5, early_stop=True, lr=0.005):
+def run_gnn(
+    nodes: List[str], 
+    final_capacities: Dict[Tuple[str, str], float], 
+    requests: Dict[Tuple[str, str], float], 
+    epochs: int = 50, 
+    time_limit_min: int = 5, 
+    early_stop: bool = True, 
+    lr: float = 0.005
+) -> Dict[str, Any]:
+    """
+    Запускает Physics-Informed GNN для решения задачи маршрутизации.
+    
+    Алгоритм состоит из двух этапов:
+    1. Обучение GNN понимать структуру графа и цели потоков.
+    2. Пошаговое распределение энергии (Incremental Routing) на основе весов от GNN.
+    
+    Args:
+        nodes: Список узлов.
+        final_capacities: Лимиты ребер.
+        requests: Заявки.
+        epochs: Число эпох обучения.
+        time_limit_min: Лимит времени (мин).
+        early_stop: Включить ли раннюю остановку.
+        lr: Скорость обучения (Learning Rate).
+    """
     start_time = time.time()
     num_nodes = len(nodes)
     node_idx = {name: i for i, name in enumerate(nodes)}
-    reverse_node_idx = {i: name for i, name in enumerate(nodes)}
-
+    
     req_list = []
     for (src, dst), amount in requests.items():
         if src in node_idx and dst in node_idx:
@@ -60,11 +106,9 @@ def run_gnn(nodes, final_capacities, requests, epochs=50, time_limit_min=5, earl
         return {'load_distribution': {}, 'delivered': {}, 'request_flows': {}}
 
     adj_mask = torch.zeros((num_nodes, num_nodes))
-    cap_matrix = torch.zeros((num_nodes, num_nodes))
-    for (u, v), cap in final_capacities.items():
+    for (u, v), _ in final_capacities.items():
         if u in node_idx and v in node_idx:
             adj_mask[node_idx[u], node_idx[v]] = 1.0
-            cap_matrix[node_idx[u], node_idx[v]] = float(cap)
 
     model = StrictEnergyGNN(num_nodes, embed_dim=32)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -72,23 +116,19 @@ def run_gnn(nodes, final_capacities, requests, epochs=50, time_limit_min=5, earl
     best_loss = float('inf')
     patience_counter = 0
 
-    # --- ЭТАП 1: Обучение GNN для понимания структуры графа ---
+    # ЭТАП 1: Обучение (Поиск графовых закономерностей)
     model.train()
     for epoch in range(epochs):
-        # Проверка лимита времени (ПУНКТ 5)
         if time.time() - start_time > time_limit_min * 60:
-            print(f"GNN: Остановка по лимиту времени на эпохе {epoch}")
             break
 
         optimizer.zero_grad()
         total_loss = 0.0
 
-        for r_idx, ((src, dst), demand) in enumerate(req_list):
+        for _, ((src, dst), _) in enumerate(req_list):
             s_i, d_i = node_idx[src], node_idx[dst]
             probs = model.get_edge_probabilities(adj_mask, d_i)
-
-            # Штраф: направлять потоки в сторону цели
-            # Используем простую эвристику расстояний
+            # Минимизируем отрицательный логарифм вероятности выбора соседа в сторону цели
             path_loss = -torch.log(probs[s_i, :].clamp(min=1e-5)).mean()
             total_loss += path_loss
 
@@ -96,94 +136,56 @@ def run_gnn(nodes, final_capacities, requests, epochs=50, time_limit_min=5, earl
             total_loss.backward()
             optimizer.step()
 
-        # Логика ранней остановки (ПУНКТ 5)
         if early_stop:
             loss_val = total_loss.item()
             if loss_val < best_loss - 0.001:
-                best_loss = loss_val
-                patience_counter = 0
+                best_loss, patience_counter = loss_val, 0
             else:
                 patience_counter += 1
-                if patience_counter > 15:
-                    print(f"GNN: Ранняя остановка (Early Stop) на эпохе {epoch}")
-                    break
+                if patience_counter > 15: break
 
-    # --- ЭТАП 2: Применение бизнес-логики (Evaluation & Routing) ---
+    # ЭТАП 2: Инкрементальная маршрутизация (бизнес-логика)
     model.eval()
-
     delivered_dict = {(src, dst): 0.0 for (src, dst), _ in req_list}
     load_distribution = defaultdict(float)
     request_flows_dict = defaultdict(lambda: defaultdict(float))
+    current_caps = {k: v for k, v in final_capacities.items()}
 
-    # Текущие свободные мощности в сети (динамически обновляются)
-    current_capacities = {k: v for k, v in final_capacities.items()}
-
-    # Чтобы соблюсти условие пропорциональности, бьем объемы на итерации (например 50 шагов)
-    # На каждом шаге каждая заявка пытается передать 2% от своего изначального объема
+    # Разбиваем на мелкие порции для обеспечения пропорциональности (Fairness)
     num_steps = 50
     step_demands = {req_key: amount / num_steps for req_key, amount in req_list}
 
     with torch.no_grad():
-        # Предрассчитаем веса ребер (штрафы) для каждой заявки на основе GNN
         gnn_weights = {}
         for (src, dst), _ in req_list:
-            d_i = node_idx[dst]
-            probs = model.get_edge_probabilities(adj_mask, d_i).numpy()
-            # Чем выше вероятность GNN, тем ниже вес (сопротивление) ребра
-            weight_matrix = -np.log(probs + 1e-9)
-            gnn_weights[(src, dst)] = weight_matrix
+            probs = model.get_edge_probabilities(adj_mask, node_idx[dst]).numpy()
+            gnn_weights[(src, dst)] = -np.log(probs + 1e-9)
 
-    for step in range(num_steps):
-        for (src, dst), amount in req_list:
-            req_key = (src, dst)
-            amount_to_send = step_demands[req_key]
-
-            if amount_to_send <= 0:
-                continue
-
-            # Ищем пути, пока не передадим порцию энергии или пока не закончатся пути
+    for _ in range(num_steps):
+        for (src, dst), _ in req_list:
+            req_key, amount_to_send = (src, dst), step_demands[(src, dst)]
             while amount_to_send > 1e-4:
-                # 1. Строим граф только из доступных ребер
                 G = nx.DiGraph()
-                for (u, v), cap in current_capacities.items():
-                    if cap > 1e-4:  # Ребро доступно
-                        u_idx, v_idx = node_idx[u], node_idx[v]
-                        # Вес ребра из GNN
-                        w = gnn_weights[req_key][u_idx, v_idx]
-                        G.add_edge(u, v, weight=w)
-
-                # 2. Ищем путь
+                for (u, v), cap in current_caps.items():
+                    if cap > 1e-4:
+                        G.add_edge(u, v, weight=gnn_weights[req_key][node_idx[u], node_idx[v]])
                 try:
-                    # GNN направляет поиск кратчайшего пути
                     path = nx.shortest_path(G, source=src, target=dst, weight='weight')
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    # Если путей больше нет, значит лимит по всем направлениям исчерпан
-                    # Оставшаяся энергия просто не доставляется (срабатывает пропорциональное ограничение)
-                    break
+                except (nx.NetworkXNoPath, nx.NodeNotFound): break
 
-                # 3. Находим "узкое горлышко" на найденном пути
-                path_edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
-                bottleneck_cap = min(current_capacities[e] for e in path_edges)
+                path_edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
+                bottleneck = min(current_caps[e] for e in path_edges)
+                flow = min(amount_to_send, bottleneck)
 
-                # Сколько энергии реально можем протолкнуть по этому пути прямо сейчас
-                flow_to_push = min(amount_to_send, bottleneck_cap)
-
-                # 4. Проталкиваем энергию и обновляем состояние
-                delivered_dict[req_key] += flow_to_push
-                amount_to_send -= flow_to_push
-
+                delivered_dict[req_key] += flow
+                amount_to_send -= flow
                 for e in path_edges:
-                    current_capacities[e] -= flow_to_push
-                    load_distribution[e] += flow_to_push
-                    request_flows_dict[req_key][e] += flow_to_push
-
-    # Очистка от пустых значений для красоты словаря
-    clean_request_flows = {
-        req: dict(flows) for req, flows in request_flows_dict.items() if flows
-    }
+                    current_caps[e] -= flow
+                    load_distribution[e] += flow
+                    request_flows_dict[req_key][e] += flow
 
     return {
         'load_distribution': dict(load_distribution),
         'delivered': delivered_dict,
-        'request_flows': clean_request_flows
+        'request_flows': {req: dict(flows) for req, flows in request_flows_dict.items() if flows}
     }

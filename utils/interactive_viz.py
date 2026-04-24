@@ -1,36 +1,59 @@
 import plotly.graph_objects as go
 import math
+from typing import List, Dict, Tuple, Any, Optional, Union
 from core.data_loader import TOPOLOGY_POS
 
 
-def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=None):
+def draw_interactive_heatmap(
+    nodes: List[str], 
+    adj: Dict[str, List[str]], 
+    capacities: Dict[Tuple[str, str], float], 
+    total_load: Dict[Tuple[str, str], float], 
+    selected_load: Optional[Dict[Tuple[str, str], float]] = None
+) -> go.Figure:
+    """
+    Создает интерактивную карту сети на базе Plotly.
+    
+    Цвет ребер меняется от синего (холодный/пустой) до красного (горячий/перегруженный).
+    Толщина ребер и стрелок может адаптироваться при выборе конкретной заявки.
+
+    Args:
+        nodes: Список узлов для отрисовки.
+        adj: Словарь смежности.
+        capacities: Лимиты пропускной способности.
+        total_load: Суммарная нагрузка на ребра от всех заявок.
+        selected_load: Нагрузка только от выбранной пользователем заявки (для подсветки).
+
+    Returns:
+        go.Figure: Объект фигуры Plotly.
+    """
     fig = go.Figure()
 
-    def get_color(ratio):
+    def get_color(ratio: float) -> str:
+        """Интерполяция цвета от синего (0%) к красному (100%+)."""
         r = int(min(255, 255 * ratio))
         b = int(max(0, 255 * (1 - ratio)))
         return f'rgb({r}, 0, {b})'
 
     mid_x, mid_y, mid_text = [], [], []
 
-    # 1. Отрисовка ребер и стрелок
+    # 1. Отрисовка ребер и стрелок перетока
     for (u, v), cap in capacities.items():
         if u not in TOPOLOGY_POS or v not in TOPOLOGY_POS: continue
         x0, y0 = TOPOLOGY_POS[u]
         x1, y1 = TOPOLOGY_POS[v]
 
-        # Определяем направление перетока
+        # Определяем направление и объем перетока
         flow_uv = total_load.get((u, v), 0.0)
         flow_vu = total_load.get((v, u), 0.0)
 
         t_load = flow_uv + flow_vu
-        s_load = (selected_load.get((u, v), 0.0) + selected_load.get((v, u),
-                                                                     0.0)) if selected_load is not None else t_load
+        s_load = (selected_load.get((u, v), 0.0) + selected_load.get((v, u), 0.0)) if selected_load is not None else t_load
 
         ratio = min(t_load / cap, 1.2) if cap > 0 else 0.0
         color = 'lightgrey' if t_load < 0.1 else get_color(ratio)
 
-        # Выравниваем размеры стрелок
+        # Логика выделения (подсветки) конкретной заявки
         if selected_load is not None:
             width = 4 if s_load > 0.1 else 1.5
             opacity = 1.0 if s_load > 0.1 else 0.3
@@ -38,7 +61,7 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
             width = 4 if t_load > 0.1 else 1.5
             opacity = 1.0
 
-        # Линия
+        # Основная линия связи
         fig.add_trace(go.Scatter(
             x=[x0, x1, None], y=[y0, y1, None],
             line=dict(width=width, color=color),
@@ -48,7 +71,7 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
             showlegend=False
         ))
 
-        # HOVER-информация
+        # Сбор данных для HOVER-информации (в центре ребра)
         mx, my = (x0 + x1) / 2, (y0 + y1) / 2
         mid_x.append(mx)
         mid_y.append(my)
@@ -60,19 +83,16 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
             mid_text.append(
                 f"Участок: {u} ↔ {v}<br>Нагрузка: <b>{t_load:.3f} из {cap:.3f} кВт</b><br>Загруженность: {ratio * 100:.3f}%")
 
-        # Вектор направления (по умолчанию по топологии схемы u -> v)
+        # Рисование стрелки направления потока
         start_x, start_y, end_x, end_y = x0, y0, x1, y1
         if flow_vu > flow_uv:
             start_x, start_y, end_x, end_y = x1, y1, x0, y0
 
-        dx = end_x - start_x
-        dy = end_y - start_y
+        dx, dy = end_x - start_x, end_y - start_y
         dist = math.hypot(dx, dy)
 
-        # РИСУЕМ СТРЕЛКУ (более компактную и аккуратную)
         if dist > 0:
             nx, ny = dx / dist, dy / dist
-            # Короткая стрелка, чтобы не перекрывать узлы
             arrow_len = min(0.2, dist * 0.1) 
 
             fig.add_annotation(
@@ -80,14 +100,14 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
                 ax=mx - nx * arrow_len, ay=my - ny * arrow_len,
                 xref='x', yref='y', axref='x', ayref='y',
                 showarrow=True,
-                arrowhead=3, # Более изящный наконечник
-                arrowsize=1, # В два раза меньше
-                arrowwidth=min(2, width), # Тоньше
+                arrowhead=3,
+                arrowsize=1,
+                arrowwidth=min(2, width),
                 arrowcolor=color,
-                opacity=opacity * 0.8 # Чуть прозрачнее
+                opacity=opacity * 0.8
             )
 
-    # 2. Отрисовка невидимых точек для HOVER-текста
+    # 2. Слой невидимых точек для всплывающих подсказок на ребрах
     if mid_x:
         fig.add_trace(go.Scatter(
             x=mid_x, y=mid_y,
@@ -99,16 +119,15 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
             showlegend=False
         ))
 
-    # 3. Отрисовка узлов
+    # 3. Отрисовка узлов (физических объектов)
     node_x, node_y, node_text, node_labels = [], [], [], []
     node_marker_color, node_marker_size, node_marker_symbol = [], [], []
 
     for node in nodes:
         if node not in TOPOLOGY_POS: continue
-        
         node_str = str(node)
         
-        # СКРЫВАЕМ ТРАНЗИТНЫЕ УЗЛЫ (строчные латинские буквы)
+        # Скрываем транзитные узлы (технические точки)
         if node_str.islower() and node_str.isalpha():
             continue
             
@@ -118,19 +137,16 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         node_text.append(f"Узел: {node}")
         node_labels.append(node_str)
 
-        # ЛОГИКА РАСПОЗНАВАНИЯ ТИПОВ УЗЛОВ
+        # Типизация маркеров
         if node_str.isupper() and node_str.isalpha() and len(node_str) == 1:
-            # Заглавные одиночные буквы (Источники A, B, C...)
             node_marker_color.append('purple')
             node_marker_size.append(18)
             node_marker_symbol.append('square')
         elif node_str.isdigit():
-            # Только цифры (Потребители 1, 2, 3...)
             node_marker_color.append('dodgerblue')
             node_marker_size.append(12)
             node_marker_symbol.append('circle')
         else:
-            # Римские цифры (Крупные узлы связи I., II., III....)
             node_marker_color.append('tomato')
             node_marker_size.append(22)
             node_marker_symbol.append('circle')
@@ -151,7 +167,7 @@ def draw_interactive_heatmap(nodes, adj, capacities, total_load, selected_load=N
         showlegend=False
     ))
 
-    # Обновленная Легенда
+    # Кастомная легенда
     legend_items = [
         ('Источники', 'purple', 'square', 15),
         ('Потребители', 'dodgerblue', 'circle', 10),
