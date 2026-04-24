@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.io as pio
 import pdfplumber
 import re
 from typing import List, Dict, Tuple, Any, Optional, Union
@@ -10,6 +11,8 @@ from core.gnn import run_gnn
 from core.rl import run_rl
 from utils.interactive_viz import draw_interactive_heatmap
 from utils.generate_dataset import generate_synthetic_network
+# Настройка Plotly: Streamlit автоматически обрабатывает офлайн-отрисовку через st.plotly_chart
+# (принудительная установка рендерера удалена во избежание конфликтов в WSL)
 
 st.set_page_config(page_title="MVP Маршрутизации Энергии", layout="wide")
 
@@ -182,10 +185,10 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
     col_e1, col_e2 = st.columns(2)
     with col_e1:
         st.markdown("**Таблица 1.1: Заявки на мощность**")
-        df_req_edited = st.data_editor(st.session_state.df_req, num_rows="dynamic", use_container_width=True, on_change=reset_results, key="editor_req")
+        df_req_edited = st.data_editor(st.session_state.df_req, num_rows="dynamic", width="stretch", on_change=reset_results, key="editor_req")
     with col_e2:
         st.markdown("**Таблица 1.2: Ограничения пропускной способности**")
-        df_cap_edited = st.data_editor(st.session_state.df_cap, num_rows="dynamic", use_container_width=True, on_change=reset_results, key="editor_cap")
+        df_cap_edited = st.data_editor(st.session_state.df_cap, num_rows="dynamic", width="stretch", on_change=reset_results, key="editor_cap")
 
     # Валидация топологии в реальном времени с защитой от ошибок парсинга в редакторе
     try:
@@ -195,7 +198,7 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
         st.markdown("---")
         if invalid_reqs:
             st.error(f"⚠️ **Обнаружено {len(invalid_reqs)} невыполнимых заявок.** Путь физически заблокирован.")
-            with st.expander("Детали недостижимых узлов"): st.dataframe(pd.DataFrame(invalid_reqs), use_container_width=True)
+            with st.expander("Детали недостижимых узлов"): st.dataframe(pd.DataFrame(invalid_reqs), width="stretch")
         elif reqs:
             st.success("✅ **Топология корректна.** Все потребители достижимы.")
     except Exception as e:
@@ -263,19 +266,19 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                         selected_load[edge] = selected_load.get(edge, 0.0) + val
 
         fig = draw_interactive_heatmap(nodes, adj, caps, final_load, selected_load)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.subheader("📊 Метрики качества распределения")
         stats = [{"Источник": s, "Потребитель": d, "Заявка": r, "Факт": res['delivered'].get((s,d),0), "%": (res['delivered'].get((s,d),0)/r*100) if r>0 else 100} for (s,d), r in reqs.items()]
         df_stats = pd.DataFrame(stats)
         c_t1, c_t2 = st.columns([2, 1])
-        c_t1.dataframe(df_stats, use_container_width=True)
-        c_t2.plotly_chart(px.histogram(df_stats, x="%", nbins=10, title="Распределение удовлетворенности", color_discrete_sequence=['#4B8BBE']), use_container_width=True)
+        c_t1.dataframe(df_stats, width="stretch")
+        c_t2.plotly_chart(px.histogram(df_stats, x="%", nbins=10, title="Распределение удовлетворенности", color_discrete_sequence=['#4B8BBE']), width="stretch")
 
     else:
         st.subheader("🗺️ Топологическая схема сети")
         st.info("Выполните расчет для визуализации потоков.")
         try:
             fig = draw_interactive_heatmap(nodes, adj, caps, {})
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except: st.warning("Недостаточно данных для отрисовки схемы.")
