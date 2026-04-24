@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import time
+from collections import defaultdict
 
 def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iterations=30, time_limit_min=5, early_stop=True, seed=42):
     rng = np.random.RandomState(seed)
@@ -25,62 +26,55 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
         paths_found = {req: [] for req in requests.keys()}
 
         for (src, dst), volume in requests.items():
-            num_ants = min(int(volume / quantum) + 1, 50)
+            num_ants = max(10, min(int(volume / quantum) + 1, 150))
+            max_steps = len(nodes) * 3
 
             for _ in range(num_ants):
-                current_node = src
-                path = [current_node]
-                visited = {current_node}
+                path = [src]
+                visited = {src}
+                step_count = 0
 
-                while current_node != dst:
+                while path and path[-1] != dst and step_count < max_steps:
+                    step_count += 1
+                    current_node = path[-1]
                     neighbors = adj.get(current_node, [])
-                    if not neighbors: break
 
                     valid_neighbors = [v for v in neighbors if v not in visited]
-                    if not valid_neighbors: break
+                    if not valid_neighbors:
+                        path.pop()
+                        continue
 
                     attractions = []
+                    valid_choices = []
                     for v in valid_neighbors:
                         edge = (current_node, v)
                         cap = capacities.get(edge, DEFAULT_CAP)
                         if cap <= 0:
-                            attr = 0.0
-                        else:
-                            attr = (pheromones[current_node][v][dst] ** 1.0) * (cap ** 0.5)
+                            continue
+
+                        attr = (pheromones[current_node][v][dst] ** 1.0) * (cap ** 0.5)
                         attractions.append(attr)
+                        valid_choices.append(v)
 
                     sum_attr = sum(attractions)
-                    if sum_attr == 0.0: break
+                    if sum_attr == 0.0:
+                        path.pop()
+                        continue
 
                     probs = [attr / sum_attr for attr in attractions]
-                    next_node = rng.choice(valid_neighbors, p=probs)
+                    next_node = rng.choice(valid_choices, p=probs)
 
                     path.append(next_node)
                     visited.add(next_node)
-                    current_node = next_node
 
-                if current_node == dst:
+                if path and path[-1] == dst:
                     paths_found[(src, dst)].append(path)
-
-        for u in pheromones:
-            for v in pheromones[u]:
-                for dest in pheromones[u][v]:
-                    pheromones[u][v][dest] = max(pheromones[u][v][dest] * 0.7, 0.0001)
-
-        for req, paths in paths_found.items():
-            dst = req[1]
-            for path in paths:
-                path_length = len(path) - 1
-                for i in range(path_length):
-                    u, v = path[i], path[i + 1]
-                    pheromones[u][v][dst] += 10.0 / path_length
 
         current_load = {edge: 0.0 for edge in capacities.keys()}
         delivered = {req: 0.0 for req in requests.keys()}
         request_flows = {req: {} for req in requests.keys()}
         successful_paths = []
 
-        edge_requests = {edge: [] for edge in capacities.keys()}
         all_path_allocs = []
 
         for req, volume in requests.items():
@@ -99,33 +93,104 @@ def run_aco(nodes, destinations, adj, capacities, requests, quantum=10.0, n_iter
             total_ants = len(paths)
             for p in unique_paths:
                 alloc_vol = volume * (path_counts[tuple(p)] / total_ants)
-                path_obj = {'req': req, 'path': p, 'vol': alloc_vol, 'orig_vol': volume}
+                path_obj = {'req': req, 'path': p, 'vol': alloc_vol, 'orig_vol': volume, 'current_vol': alloc_vol}
                 all_path_allocs.append(path_obj)
 
+        for _ in range(15):
+            edge_loads = defaultdict(float)
+            edge_req_flows = defaultdict(lambda: defaultdict(float))
+            edge_req_paths = defaultdict(lambda: defaultdict(list))
+
+            for po in all_path_allocs:
+                if po['current_vol'] <= 0: continue
+                p = po['path']
+                req = po['req']
                 for i in range(len(p) - 1):
                     edge = (p[i], p[i+1])
-                    if edge in edge_requests:
-                        edge_requests[edge].append(path_obj)
+                    edge_loads[edge] += po['current_vol']
+                    edge_req_flows[edge][req] += po['current_vol']
+                    edge_req_paths[edge][req].append(po)
 
-        active_allocs = {id(po): po for po in all_path_allocs}
-        path_scaling = {id(po): 1.0 for po in all_path_allocs}
+            overloaded = False
+            path_scaling = {id(po): 1.0 for po in all_path_allocs}
 
-        for edge, reqs_on_edge in edge_requests.items():
-            cap = capacities.get(edge, 0.0)
-            if cap <= 0:
-                for po in reqs_on_edge:
-                    path_scaling[id(po)] = 0.0
-                continue
+            for edge, load in edge_loads.items():
+                cap = capacities.get(edge, 0.0)
+                if cap <= 0:
+                    for req, pos in edge_req_paths[edge].items():
+                        for po in pos:
+                            path_scaling[id(po)] = 0.0
+                    overloaded = True
+                    continue
 
-            total_req_vol = sum(po['vol'] for po in reqs_on_edge)
-            if total_req_vol > cap:
-                scale_factor = cap / total_req_vol
-                for po in reqs_on_edge:
-                    path_scaling[id(po)] = min(path_scaling[id(po)], scale_factor)
+                if load <= cap + 1e-4:
+                    continue
+
+                overloaded = True
+
+                req_flow_on_edge = edge_req_flows[edge]
+                req_paths_on_edge = edge_req_paths[edge]
+
+                remaining_cap = cap
+                uncapped = set(req_flow_on_edge.keys())
+                final_alloc = {}
+
+                while uncapped and remaining_cap > 1e-6:
+                    total_orig_demand_uncapped = sum(requests[req] for req in uncapped)
+                    if total_orig_demand_uncapped <= 0:
+                        break
+
+                    fitted = set()
+                    for req in uncapped:
+                        share = remaining_cap * (requests[req] / total_orig_demand_uncapped)
+                        if req_flow_on_edge[req] <= share + 1e-6:
+                            final_alloc[req] = req_flow_on_edge[req]
+                            fitted.add(req)
+
+                    if not fitted:
+                        for req in uncapped:
+                            final_alloc[req] = remaining_cap * (requests[req] / total_orig_demand_uncapped)
+                        break
+
+                    for req in fitted:
+                        remaining_cap -= final_alloc[req]
+                        uncapped.remove(req)
+
+                for req, alloc in final_alloc.items():
+                    actual = req_flow_on_edge[req]
+                    if actual > alloc + 1e-6:
+                        local_scale = alloc / actual
+                        for po in req_paths_on_edge[req]:
+                            path_scaling[id(po)] = min(path_scaling[id(po)], local_scale)
+
+            for po in all_path_allocs:
+                po['current_vol'] *= path_scaling[id(po)]
+
+            if not overloaded:
+                break
+
+        for u in pheromones:
+            for v in pheromones[u]:
+                for dest in pheromones[u][v]:
+                    pheromones[u][v][dest] = max(pheromones[u][v][dest] * 0.7, 0.0001)
+
+        for po in all_path_allocs:
+            final_vol = po['current_vol']
+            if final_vol > 1e-4:
+                p = po['path']
+                dst = po['req'][1]
+                path_length = len(p) - 1
+                if path_length > 0:
+                    total_ants_for_req = len(paths_found[po['req']])
+                    effective_ants = (final_vol / po['orig_vol']) * total_ants_for_req
+                    reward = effective_ants * (10.0 / path_length)
+                    for i in range(path_length):
+                        u, v = p[i], p[i+1]
+                        pheromones[u][v][dst] += reward
 
         iter_delivered_sum = 0.0
         for po in all_path_allocs:
-            final_vol = po['vol'] * path_scaling[id(po)]
+            final_vol = po['current_vol']
             if final_vol > 0.001:
                 p = po['path']
                 delivered[po['req']] += final_vol
