@@ -289,7 +289,7 @@ if st.session_state.df_req is not None and st.session_state.df_cap is not None:
                 ratio = load / cap if cap > 0 else 0
                 edge_list.append({
                     'edge': (u, v),
-                    'label': f"{u} → {v} (Загрузка: {ratio:.1%}, {load:.3f}/{cap:.0f} кВт)",
+                    'label': f"{u} → {v} (Загрузка: {ratio:.1%}, {load:.3f}/{cap:.3f} кВт)",
                     'ratio': ratio
                 })
 
