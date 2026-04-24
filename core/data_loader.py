@@ -1,5 +1,6 @@
 import pandas as pd
 import networkx as nx
+import re
 from typing import List, Dict, Tuple, Any, Optional, Set, Union
 
 # Константы топологии для удобства управления
@@ -8,67 +9,47 @@ BASE_TOPOLOGY: List[Tuple[str, str]] = [
     ('F', 'II.'), ('G', 'II.'), ('H', 'III.'), ('I', 'V.'), ('J', 'VIII.'),
     ('K', 'XVI.'),
     ('M', 'X.'), ('N', 'VII.'), ('O', 'VII.'), ('P', 'XI.'),
-
-    # Нижняя магистраль
     ('XVIII.', 'g'), ('g', '5'), ('g', '6'), ('6', '7'),
     ('XVIII.', 'h'), ('h', '4'), ('h', 'i'), ('i', '9'), ('i', 'XI.'),
     ('XI.', 'j'), ('j', '11'), ('j', 'k'), ('k', '10'), ('k', 'X.'),
     ('X.', '12'), ('X.', 'IX.'),
     ('IX.', 'l'), ('l', '8'), ('l', 'XV.'),
-
     ('XIV.', '29'),
     ('XV.', 'XIV.'),
-
-    # Цепочка XIV -> XII
     ('XIV.', 'm'), ('m', '23'),
     ('m', 'n'), ('n', '26'),
     ('n', 'o'), ('o', '22'),
     ('o', 'p'), ('p', '21'),
-    ('o', 'p'), ('p', '21'),
     ('p', 'q'), ('q', '28'),
     ('q', 'XII.'),
-
     ('XII.', '3'), ('XII.', 'XIII.'),
     ('XIII.', '17'),
     ('XIII.', '13'), ('XIII.', '18'), ('XIII.', '24'),
     ('13', '14'), ('13', '25'),
-
-    # Цепочка XII -> VI
     ('XII.', 'r'), ('r', '20'),
     ('r', 's'), ('s', '19'),
     ('s', 'VI.'),
-
-    # Верхняя магистраль
     ('VII.', 'VI.'),
     ('VI.', '27'), ('VI.', '15'),
     ('15', '16'),
-
-    # Цепочка из VI для 35 и 36 и выход на V.
     ('VI.', 't'), ('t', 'u'), ('u', 'V.'),
     ('t', '35'), ('u', '36'),
-
     ('V.', 'VIII.'), ('VIII.', '37'),
-
-    # Соединение магистралей
     ('II.', 'I.'), ('IX.', 'I.'),
     ('I.', 'a'), ('a', 'b'), ('b', 'III.'),
     ('a', '31'), ('b', '30'),
-
     ('III.', 'c'), ('c', 'd'), ('d', 'IV.'),
     ('c', '34'), ('d', '33'),
-
     ('XVI.', 'x'), ('L', 'x'),
     ('x', 'y'),
     ('y', '38'), ('y', '1'),
     ('1', '2'),
-
     ('XVII.', 'IV.'),
     ('IV.', 'XVI.'),
-
     ('V.', 'e'), ('e', '32'), ('e', 'XVII.')
 ]
 
-# Географические координаты узлов для визуализации
+# Координаты узлов для визуализации
 TOPOLOGY_POS: Dict[str, Tuple[float, float]] = {
     'XIII.': (-11, 0), 'XII.': (-8.5, 0), 'XIV.': (-5, 0), 'XV.': (-2, 0),
     'IX.': (1.5, 0), 'X.': (4.5, 0), 'XI.': (9, 0), 'XVIII.': (13, 0),
@@ -107,35 +88,26 @@ def is_hidden(node: Any) -> bool:
 
 
 def get_logical_edges() -> List[Tuple[str, str]]:
-    """
-    Возвращает список логических связей между реальными объектами,
-    абстрагируясь от скрытых промежуточных узлов.
-    """
+    """Возвращает список логических связей между реальными объектами."""
     visible_nodes = [n for n in TOPOLOGY_POS.keys() if not is_hidden(n)]
     G = nx.DiGraph(BASE_TOPOLOGY)
-
     logical_edges = []
     for u in visible_nodes:
         for v in visible_nodes:
             if u == v: continue
             try:
                 path = nx.shortest_path(G, u, v)
-                # Логическая связь существует, если путь состоит только из скрытых узлов посередине
                 if len(path) > 1 and all(is_hidden(node) for node in path[1:-1]):
                     logical_edges.append((u, v))
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                continue
+            except (nx.NetworkXNoPath, nx.NodeNotFound): continue
     return sorted(logical_edges)
 
 
 def get_current_topology(reversed_logical_edges: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """
-    Формирует список ребер с учетом развернутых направлений на пульте управления.
-    """
+    """Формирует список ребер с учетом развернутых направлений."""
     G = nx.DiGraph(BASE_TOPOLOGY)
     edges_to_remove = set()
     edges_to_add = set()
-
     for u, v in reversed_logical_edges:
         try:
             path = nx.shortest_path(G, u, v)
@@ -144,16 +116,42 @@ def get_current_topology(reversed_logical_edges: List[Tuple[str, str]]) -> List[
                 edges_to_remove.add(seg)
                 edges_to_add.add((path[i + 1], path[i]))
         except: continue
-
     new_edges = [e for e in BASE_TOPOLOGY if e not in edges_to_remove]
     new_edges.extend(list(edges_to_add))
     return new_edges
 
 
-def normalize_node(val: Any) -> str:
-    """Очистка и нормализация имени узла."""
-    if val is None: return ""
-    return str(val).strip()
+def normalize_node_strictly(val: Any) -> str:
+    """
+    Глубокая очистка имени узла от невидимых символов и лишних пробелов.
+    
+    Args:
+        val: Значение из ячейки (строка, число или NaN).
+    """
+    if pd.isna(val) or val is None:
+        return ""
+    # Удаление непечатаемых символов и лишних пробелов
+    s = str(val)
+    s = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', s)
+    return s.strip()
+
+
+def parse_float_safely(val: Any, default: float = 0.0) -> float:
+    """
+    Безопасный парсинг числа с поддержкой разных разделителей и очисткой.
+    
+    Args:
+        val: Входное значение.
+        default: Значение по умолчанию при ошибке.
+    """
+    if pd.isna(val) or val is None or str(val).strip() == "":
+        return default
+    try:
+        s = str(val).replace(',', '.').replace(' ', '')
+        s = re.sub(r'[^\d.-]', '', s)  # Удаление лишнего мусора, оставляем цифры, точку и минус
+        return float(s)
+    except (ValueError, TypeError):
+        return default
 
 
 def load_network_data(
@@ -162,10 +160,7 @@ def load_network_data(
     topology_override: Optional[List[Tuple[str, str]]] = None
 ) -> Tuple[List[str], List[str], Dict[str, List[str]], Dict[Tuple[str, str], float], Dict[Tuple[str, str], float], List[Dict]]:
     """
-    Загружает и валидирует все данные сети: топологию, заявки и ограничения.
-    
-    Returns:
-        Tuple: (nodes, destinations, adj, capacities, requests, invalid_requests)
+    Загружает данные сети с жесткой валидацией и защитой от зашумленных данных.
     """
     requests = {}
     invalid_requests = []
@@ -180,38 +175,42 @@ def load_network_data(
     total_requested = 0
     if df_req is not None:
         for _, row in df_req.iterrows():
-            src, dst = normalize_node(row.get('Источник потока')), normalize_node(row.get('Потребитель'))
-            try:
-                val_str = str(row.get('Поток, кВт', 0)).replace(',', '.').replace(' ', '')
-                vol = float(val_str)
-                if src and dst and vol > 0:
-                    nodes_set.update([src, dst])
-                    if src in G_active and dst in G_active and nx.has_path(G_active, src, dst):
-                        requests[(src, dst)] = requests.get((src, dst), 0.0) + vol
-                        total_requested += vol
-                    else:
-                        invalid_requests.append({"Источник": src, "Потребитель": dst, "Объем (кВт)": vol})
-            except (ValueError, TypeError): continue
+            src = normalize_node_strictly(row.get('Источник потока'))
+            dst = normalize_node_strictly(row.get('Потребитель'))
+            vol = parse_float_safely(row.get('Поток, кВт'), 0.0)
+            
+            if src and dst and vol > 0:
+                nodes_set.update([src, dst])
+                if src in G_active and dst in G_active and nx.has_path(G_active, src, dst):
+                    requests[(src, dst)] = requests.get((src, dst), 0.0) + vol
+                    total_requested += vol
+                else:
+                    invalid_requests.append({"Источник": src, "Потребитель": dst, "Объем (кВт)": vol})
 
-    # Базовая пропускная способность для нелимитированных участков
-    unlimited_cap = total_requested + 10000.0
+    # При пропущенном лимите (NaN) используем "бесконечную" пропускную способность
+    unlimited_cap = total_requested + 100000.0
     final_capacities = {(u, v): unlimited_cap for u, v in active_topology}
 
     if df_cap is not None:
         for _, row in df_cap.iterrows():
             try:
-                u, v = normalize_node(row.get('начало')), normalize_node(row.get('окончание'))
-                cap_val = row.get('Допустимая мощность', unlimited_cap)
-                cap = float(str(cap_val).replace(',', '.').replace(' ', ''))
+                u = normalize_node_strictly(row.get('начало'))
+                v = normalize_node_strictly(row.get('окончание'))
+                # Если мощность не указана (NaN), она считается неограниченной (per task)
+                cap = parse_float_safely(row.get('Допустимая мощность'), unlimited_cap)
+                
                 if not u or not v: continue
+                
                 try:
                     path = nx.shortest_path(G_undirected, u, v)
                     for i in range(len(path) - 1):
                         n1, n2 = path[i], path[i + 1]
-                        if (n1, n2) in final_capacities: final_capacities[(n1, n2)] = min(final_capacities[(n1, n2)], cap)
-                        if (n2, n1) in final_capacities: final_capacities[(n2, n1)] = min(final_capacities[(n2, n1)], cap)
+                        if (n1, n2) in final_capacities:
+                            final_capacities[(n1, n2)] = min(final_capacities[(n1, n2)], cap)
+                        if (n2, n1) in final_capacities:
+                            final_capacities[(n2, n1)] = min(final_capacities[(n2, n1)], cap)
                 except (nx.NetworkXNoPath, nx.NodeNotFound): pass
-            except (ValueError, TypeError): continue
+            except: continue
 
     nodes = list(nodes_set)
     destinations = list(set(dst for src, dst in requests.keys()))
